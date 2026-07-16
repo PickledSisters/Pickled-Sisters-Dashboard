@@ -161,12 +161,37 @@ const ADAPTERS = {
      connect.squareupsandbox.com.
   */
   pos: {
-    configured: false,
-    auth: null,
+    /* Wired for Square. Pasted production personal access token (secret
+       POS_API_TOKEN) - no OAuth dance, see capability-matrix.md (Square).
+       Counts COMPLETED orders only via /v2/orders/search (order_entries only
+       - never pulls a dollar amount), across every ACTIVE location on the
+       account. If the token is a Sandbox token it will simply fail against
+       the production host below - that surfaces as a plain connection error
+       rather than silently showing fake data. */
+    configured: true,
+    auth: 'token',
     oauth: {},
-    async status(env, h) { return { connected: false }; },
-    async fetchRange(env, h, q) { throw new NotConfigured('pos'); },
-    async fetchMonthly(env, h, q) { throw new NotConfigured('pos'); }
+    async status(env, h) {
+      if (!env.POS_API_TOKEN) return { connected: false };
+      const locs = await squareActiveLocations(env);
+      return { connected: true, org: locs.map((l) => l.name).filter(Boolean).join(', ') || null, sandbox: false, lastSync: null };
+    },
+    async fetchRange(env, h, q) {
+      const count = await squareCountCompletedOrders(env, q.from, q.to, q.tz || 'Australia/Sydney', q.rollover || 0);
+      return { count };
+    },
+    async fetchMonthly(env, h, q) {
+      const months = monthList(q.fromMonth, q.toMonth);
+      const counts = [];
+      for (const mo of months) {
+        const [y, m] = mo.split('-').map(Number);
+        const from = mo + '-01';
+        const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
+        const to = mo + '-' + String(lastDay).padStart(2, '0');
+        counts.push(await squareCountCompletedOrders(env, from, to, q.tz || 'Australia/Sydney', q.rollover || 0));
+      }
+      return { months, count: counts };
+    }
   },
 
   /* >>> ADAPTER 3: ROSTERING (optional - only if the owner has one)
@@ -275,6 +300,97 @@ function lastDayOfMonth(yyyyMm) {
   const [y, m] = yyyyMm.split('-').map(Number);
   const d = new Date(Date.UTC(y, m, 0)).getUTCDate();
   return yyyyMm + '-' + String(d).padStart(2, '0');
+}
+
+/* ---------------- Square helpers (used by the POS adapter) --------------
+   Pasted-token auth (not OAuth), so calls go via plain fetch with the
+   POS_API_TOKEN secret attached directly - h.fetchJson's auto-Bearer only
+   applies to auth:'oauth' sources. Production host only
+   (connect.squareup.com); a Sandbox token simply fails here rather than
+   quietly returning fake data (see capability-matrix.md, Square: sandbox
+   risk). */
+const SQUARE_VERSION = '2026-01-22';
+
+async function squareApiFetch(env, method, path, body) {
+  const res = await fetch('https://connect.squareup.com' + path, {
+    method,
+    headers: {
+      'Authorization': 'Bearer ' + (env.POS_API_TOKEN || ''),
+      'Square-Version': SQUARE_VERSION,
+      'Content-Type': 'application/json'
+    },
+    body: body ? JSON.stringify(body) : undefined
+  });
+  if (!res.ok) { const e = new Error('Square HTTP ' + res.status); e.status = res.status; throw e; }
+  return res.json();
+}
+
+async function squareActiveLocations(env) {
+  const data = await squareApiFetch(env, 'GET', '/v2/locations');
+  return (data.locations || []).filter((l) => l.status === 'ACTIVE');
+}
+
+/* Converts a wall-clock time in an IANA zone to a UTC instant (ms), using
+   Intl to read the zone's offset at that instant and correcting for it -
+   handles AEST/AEDT and any other zone without a fixed-offset table. */
+function tzOffsetMs(instantMs, tz) {
+  const dtf = new Intl.DateTimeFormat('en-US', {
+    timeZone: tz, hourCycle: 'h23',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit'
+  });
+  const parts = dtf.formatToParts(new Date(instantMs));
+  const map = {};
+  for (const p of parts) map[p.type] = p.value;
+  const asUtc = Date.UTC(+map.year, +map.month - 1, +map.day, +map.hour === 24 ? 0 : +map.hour, +map.minute, +map.second);
+  return asUtc - instantMs;
+}
+function zonedWallTimeToUtcMs(y, mo, d, h, mi, s, tz) {
+  let guess = Date.UTC(y, mo - 1, d, h, mi, s);
+  for (let i = 0; i < 2; i++) guess = Date.UTC(y, mo - 1, d, h, mi, s) - tzOffsetMs(guess, tz);
+  return guess;
+}
+function addDaysUTCDateParts(y, mo, d, days) {
+  const dt = new Date(Date.UTC(y, mo - 1, d));
+  dt.setUTCDate(dt.getUTCDate() + days);
+  return { y: dt.getUTCFullYear(), m: dt.getUTCMonth() + 1, d: dt.getUTCDate() };
+}
+
+/* Counts COMPLETED orders closed within [fromStr, toStr] inclusive, in the
+   venue's timezone, with the trading-day boundary shifted by `rollover`
+   hours (e.g. rollover=4 means the trading day runs 4am-4am, so sales up to
+   4am count to the previous trading day). Paginates via cursor; sums
+   order_entries.length only (order entries carry no dollar amount). */
+async function squareCountCompletedOrders(env, fromStr, toStr, tz, rollover) {
+  const locs = await squareActiveLocations(env);
+  const locationIds = locs.map((l) => l.id).slice(0, 10); /* API max 10 ids/call */
+  if (!locationIds.length) return 0;
+
+  const [y1, m1, d1] = fromStr.split('-').map(Number);
+  const [y2, m2, d2] = toStr.split('-').map(Number);
+  const startMs = zonedWallTimeToUtcMs(y1, m1, d1, rollover, 0, 0, tz);
+  const endParts = addDaysUTCDateParts(y2, m2, d2, 1);
+  const endMs = zonedWallTimeToUtcMs(endParts.y, endParts.m, endParts.d, rollover, 0, 0, tz);
+
+  let cursor, count = 0;
+  do {
+    const body = {
+      return_entries: true,
+      limit: 1000,
+      location_ids: locationIds,
+      query: {
+        filter: {
+          date_time_filter: { closed_at: { start_at: new Date(startMs).toISOString(), end_at: new Date(endMs).toISOString() } },
+          state_filter: { states: ['COMPLETED'] }
+        }
+      }
+    };
+    if (cursor) body.cursor = cursor;
+    const data = await squareApiFetch(env, 'POST', '/v2/orders/search', body);
+    count += (data.order_entries || []).length;
+    cursor = data.cursor;
+  } while (cursor);
+  return count;
 }
 
 /* ============================================================================
