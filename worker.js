@@ -79,22 +79,72 @@ const ADAPTERS = {
      'Demo Company'. Secrets: ACCOUNTING_CLIENT_ID, ACCOUNTING_CLIENT_SECRET.
   */
   accounting: {
-    configured: false,
-    auth: null, /* 'oauth' | 'token' */
+    /* Wired for Xero - see capability-matrix.md (Xero) for the dated specifics
+       this follows: granular scopes (apps created on/after 2 Mar 2026 can't use
+       the old broad accounting.reports.read), HTTP Basic client auth at the
+       token endpoint, single-use rotating refresh tokens (handled by the shell's
+       token store already), periods capped at 12 per P&L call. */
+    configured: true,
+    auth: 'oauth',
     oauth: {
-      /* Example (Xero) - fill these when you wire the adapter:
-         authorizeUrl: 'https://login.xero.com/identity/connect/authorize',
-         tokenUrl: 'https://identity.xero.com/connect/token',
-         scopes: 'offline_access accounting.reports.profitandloss.read',
-         clientIdSecret: 'ACCOUNTING_CLIENT_ID',
-         clientSecretSecret: 'ACCOUNTING_CLIENT_SECRET',
-         tokenAuth: 'basic'   // Xero's token endpoint wants HTTP Basic client auth
-                              // (client_secret_basic). Use 'post' only for providers
-                              // that expect client_id/secret in the form body. */
+      authorizeUrl: 'https://login.xero.com/identity/connect/authorize',
+      tokenUrl: 'https://identity.xero.com/connect/token',
+      scopes: 'offline_access accounting.reports.profitandloss.read',
+      clientIdSecret: 'ACCOUNTING_CLIENT_ID',
+      clientSecretSecret: 'ACCOUNTING_CLIENT_SECRET',
+      tokenAuth: 'basic'
     },
-    async status(env, h) { return { connected: false }; },
-    async fetchRange(env, h, q) { throw new NotConfigured('accounting'); },
-    async fetchMonthly(env, h, q) { throw new NotConfigured('accounting'); }
+    async status(env, h) {
+      const conns = await h.fetchJson('https://api.xero.com/connections', {});
+      if (!Array.isArray(conns) || !conns.length) return { connected: false };
+      const c = conns[0];
+      return {
+        connected: true,
+        org: c.tenantName || null,
+        sandbox: /demo company/i.test(c.tenantName || ''),
+        lastSync: null
+      };
+    },
+    async fetchRange(env, h, q) {
+      const tenantId = await xeroTenantId(h);
+      const report = await h.fetchJson(
+        'https://api.xero.com/api.xro/2.0/Reports/ProfitAndLoss?fromDate=' + q.from + '&toDate=' + q.to,
+        { headers: { 'Xero-Tenant-Id': tenantId, 'Accept': 'application/json' } }
+      );
+      const cols = xeroPLColumns(report);
+      return cols[0] || { revenue: null, cogs: null, wagesSuper: null, overheads: null };
+    },
+    async fetchMonthly(env, h, q) {
+      const tenantId = await xeroTenantId(h);
+      const months = monthList(q.fromMonth, q.toMonth);
+      const out = {
+        months,
+        revenue: new Array(months.length).fill(null),
+        cogs: new Array(months.length).fill(null),
+        wagesSuper: new Array(months.length).fill(null),
+        overheads: new Array(months.length).fill(null)
+      };
+      const CHUNK = 12; /* Xero caps `periods` at 12 per call - stitch longer trends */
+      for (let start = 0; start < months.length; start += CHUNK) {
+        const chunk = months.slice(start, start + CHUNK);
+        const toDate = lastDayOfMonth(chunk[chunk.length - 1]);
+        const report = await h.fetchJson(
+          'https://api.xero.com/api.xro/2.0/Reports/ProfitAndLoss?periods=' + (chunk.length - 1)
+            + '&timeframe=MONTH&toDate=' + toDate,
+          { headers: { 'Xero-Tenant-Id': tenantId, 'Accept': 'application/json' } }
+        );
+        const cols = xeroPLColumns(report);
+        chunk.forEach((mo, i) => {
+          const c = cols[i] || {};
+          const idx = start + i;
+          out.revenue[idx] = c.revenue ?? null;
+          out.cogs[idx] = c.cogs ?? null;
+          out.wagesSuper[idx] = c.wagesSuper ?? null;
+          out.overheads[idx] = c.overheads ?? null;
+        });
+      }
+      return out;
+    }
   },
 
   /* >>> ADAPTER 2: POS
@@ -137,6 +187,95 @@ const ADAPTERS = {
     async fetchMonthly(env, h, q) { return { months: [], cost: [] }; }
   }
 };
+
+/* ---------------- Xero P&L helpers (used by the accounting adapter) ----
+   Walks Reports[0].Rows, finds the Income/Revenue, Cost of Sales and
+   Operating Expenses sections (by title, case-insensitively), and returns
+   one { revenue, cogs, wagesSuper, overheads } object per period column.
+   Wage/super lines are matched by keyword within Operating Expenses and
+   pulled out of Overheads - see kpi-spec.md (Wage %) and
+   capability-matrix.md (Xero: "Reading the P&L + finding wages/super") for
+   why this is proposed by keyword match, then confirmed with the owner
+   during reconciliation rather than trusted blind. */
+const XERO_WAGE_RE = /wages|salaries|superannuation|\bsuper\b|payroll|annual leave|long service|workcover/i;
+
+function xeroSectionKind(title) {
+  const t = (title || '').toLowerCase();
+  if (/cost of sales|cost of goods/.test(t)) return 'cos';
+  if (/operating expenses|^expenses$/.test(t)) return 'opex';
+  if (/^income$|^revenue$|^trading income$/.test(t)) return 'income';
+  return null;
+}
+
+/* Recursively collects leaf Row lines and the section's own (outermost)
+   SummaryRow, so nested sub-sections (some charts of accounts group
+   accounts under headers) are handled without double-counting. */
+function xeroCollectSection(rows, out) {
+  for (const r of rows || []) {
+    if (!r) continue;
+    if (r.RowType === 'Row') out.leaves.push(r);
+    else if (r.RowType === 'SummaryRow') out.summary = r;
+    else if (r.RowType === 'Section') xeroCollectSection(r.Rows, out);
+  }
+}
+
+function xeroRowAmounts(row) {
+  return (row.Cells || []).slice(1).map((c) => {
+    const n = parseFloat(c && c.Value);
+    return isFinite(n) ? n : 0;
+  });
+}
+
+function xeroPLColumns(report) {
+  const topRows = (report && report.Reports && report.Reports[0] && report.Reports[0].Rows) || [];
+  const buckets = { income: { leaves: [], summary: null }, cos: { leaves: [], summary: null }, opex: { leaves: [], summary: null } };
+  let numCols = 0;
+
+  for (const sec of topRows) {
+    if (!sec || sec.RowType !== 'Section') continue;
+    const kind = xeroSectionKind(sec.Title);
+    if (!kind) continue;
+    xeroCollectSection(sec.Rows, buckets[kind]);
+  }
+  for (const kind of ['income', 'cos', 'opex']) {
+    for (const r of buckets[kind].leaves) numCols = Math.max(numCols, xeroRowAmounts(r).length);
+    if (buckets[kind].summary) numCols = Math.max(numCols, xeroRowAmounts(buckets[kind].summary).length);
+  }
+
+  const sumLeaves = (leaves, i, filter) => leaves.reduce((a, r) => {
+    if (filter && !filter(r)) return a;
+    const amts = xeroRowAmounts(r);
+    return a + (amts[i] || 0);
+  }, 0);
+
+  const cols = [];
+  for (let i = 0; i < numCols; i++) {
+    const revenue = buckets.income.summary ? xeroRowAmounts(buckets.income.summary)[i] : sumLeaves(buckets.income.leaves, i);
+    const cogs = buckets.cos.summary ? xeroRowAmounts(buckets.cos.summary)[i] : sumLeaves(buckets.cos.leaves, i);
+    const opexTotal = buckets.opex.summary ? xeroRowAmounts(buckets.opex.summary)[i] : sumLeaves(buckets.opex.leaves, i);
+    const wagesSuper = sumLeaves(buckets.opex.leaves, i, (r) => XERO_WAGE_RE.test((r.Cells && r.Cells[0] && r.Cells[0].Value) || ''));
+    const round2 = (n) => Math.round((n || 0) * 100) / 100;
+    cols.push({
+      revenue: round2(revenue),
+      cogs: round2(cogs),
+      wagesSuper: round2(wagesSuper),
+      overheads: round2(opexTotal - wagesSuper)
+    });
+  }
+  return cols;
+}
+
+async function xeroTenantId(h) {
+  const conns = await h.fetchJson('https://api.xero.com/connections', {});
+  if (!Array.isArray(conns) || !conns.length) { const e = new Error('no Xero connection'); e.status = 401; throw e; }
+  return conns[0].tenantId;
+}
+
+function lastDayOfMonth(yyyyMm) {
+  const [y, m] = yyyyMm.split('-').map(Number);
+  const d = new Date(Date.UTC(y, m, 0)).getUTCDate();
+  return yyyyMm + '-' + String(d).padStart(2, '0');
+}
 
 /* ============================================================================
    Everything below is the shell. You should rarely need to edit it.
