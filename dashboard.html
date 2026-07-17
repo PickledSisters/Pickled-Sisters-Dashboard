@@ -944,12 +944,25 @@ function sellersExtraCard(r) {
     if (!items.length) { body.textContent = 'No sales items found for this period.'; return; }
     var top = items.slice(0, 5);
     var bottom = items.slice(-5).reverse();
-    var topLine = el('div', 'conn-line');
-    topLine.innerHTML = '<b>Top sellers:</b> ' + top.map(function (i) { return esc(i.name) + ' (' + i.qty + ')'; }).join(', ');
-    var botLine = el('div', 'conn-line');
-    botLine.innerHTML = '<b>Slow movers:</b> ' + bottom.map(function (i) { return esc(i.name) + ' (' + i.qty + ')'; }).join(', ');
-    body.appendChild(topLine);
-    body.appendChild(botLine);
+
+    function sellerList(title, rows) {
+      var section = el('div', '');
+      section.style.marginTop = '0.6rem';
+      section.appendChild(el('div', 'conn-line', title));
+      var ol = document.createElement('ol');
+      ol.style.cssText = 'margin:0.3rem 0 0;padding-left:1.3rem;font-size:13px;color:var(--text-body);';
+      rows.forEach(function (i) {
+        var li = document.createElement('li');
+        li.style.padding = '2px 0';
+        li.textContent = esc(i.name) + ' — ' + i.qty + (i.qty === 1 ? ' unit' : ' units');
+        ol.appendChild(li);
+      });
+      section.appendChild(ol);
+      return section;
+    }
+
+    body.appendChild(sellerList('Top sellers', top));
+    body.appendChild(sellerList('Slow movers', bottom));
   }).catch(function () { body.textContent = 'Could not load sellers data just now.'; });
   return wrap;
 }
