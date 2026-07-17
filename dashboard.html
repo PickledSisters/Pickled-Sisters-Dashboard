@@ -892,6 +892,66 @@ function renderDashboard(root) {
      no self-serve API), kept as its own clearly-labelled figure so it never
      gets confused with the core, reconciled board. */
   root.appendChild(coversExtraCard(cur, r));
+
+  /* Extras: sales by daypart, and top/bottom sellers - both from Square,
+     both by COUNT/QUANTITY only (never a dollar figure off the POS - see
+     CLAUDE.md rule 2). Not part of kpi-spec.md's locked six/seven. */
+  root.appendChild(daypartExtraCard(r));
+  root.appendChild(sellersExtraCard(r));
+}
+
+function extrasApiUrl(path, r) {
+  return path + '?cur=' + r.from + ':' + r.to
+    + '&tz=' + encodeURIComponent(SETTINGS.timezone)
+    + '&rollover=' + (+SETTINGS.rolloverHour || 0);
+}
+
+function daypartExtraCard(r) {
+  var wrap = el('div', 'mcard fade-in');
+  wrap.style.marginTop = '1rem';
+  wrap.appendChild(el('div', 'm-label', 'Sales by daypart · extra, transaction counts from Square'));
+  var body = el('div', 'm-def', 'Loading…');
+  wrap.appendChild(body);
+  fetch(extrasApiUrl('/api/extras/dayparts', r)).then(function (res) { return res.json(); }).then(function (j) {
+    body.innerHTML = '';
+    if (!j.configured) { body.textContent = 'Not configured — connect Square first.'; return; }
+    if (j.error) { body.textContent = j.error; return; }
+    (j.dayparts || []).forEach(function (d) {
+      var row = el('div', 'conn-line');
+      row.textContent = d.label + ': ' + d.count + ' transactions';
+      body.appendChild(row);
+    });
+    if (j.other) {
+      var row2 = el('div', 'conn-line');
+      row2.textContent = 'Outside these windows: ' + j.other + ' transactions';
+      body.appendChild(row2);
+    }
+  }).catch(function () { body.textContent = 'Could not load daypart data just now.'; });
+  return wrap;
+}
+
+function sellersExtraCard(r) {
+  var wrap = el('div', 'mcard fade-in');
+  wrap.style.marginTop = '1rem';
+  wrap.appendChild(el('div', 'm-label', 'Top and bottom sellers · extra, units sold from Square'));
+  var body = el('div', 'm-def', 'Loading…');
+  wrap.appendChild(body);
+  fetch(extrasApiUrl('/api/extras/sellers', r)).then(function (res) { return res.json(); }).then(function (j) {
+    body.innerHTML = '';
+    if (!j.configured) { body.textContent = 'Not configured — connect Square first.'; return; }
+    if (j.error) { body.textContent = j.error; return; }
+    var items = j.items || [];
+    if (!items.length) { body.textContent = 'No sales items found for this period.'; return; }
+    var top = items.slice(0, 5);
+    var bottom = items.slice(-5).reverse();
+    var topLine = el('div', 'conn-line');
+    topLine.innerHTML = '<b>Top sellers:</b> ' + top.map(function (i) { return esc(i.name) + ' (' + i.qty + ')'; }).join(', ');
+    var botLine = el('div', 'conn-line');
+    botLine.innerHTML = '<b>Slow movers:</b> ' + bottom.map(function (i) { return esc(i.name) + ' (' + i.qty + ')'; }).join(', ');
+    body.appendChild(topLine);
+    body.appendChild(botLine);
+  }).catch(function () { body.textContent = 'Could not load sellers data just now.'; });
+  return wrap;
 }
 
 function coversValue(slot) {

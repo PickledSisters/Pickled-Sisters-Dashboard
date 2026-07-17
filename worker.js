@@ -915,6 +915,107 @@ async function apiCovers(env, request) {
   return json({ ok: true });
 }
 
+/* ---------------- Square extras: daypart split + top/bottom sellers ------
+   Both extras, added at the owner's request - NOT part of kpi-spec.md's
+   locked six/seven. Quantity and transaction-count only, never a dollar
+   figure pulled from Square (CLAUDE.md rule 2, no exceptions): full Order
+   objects are fetched (needed for closed_at timestamps and line_item
+   quantities), but every *_money field on those objects is deliberately
+   left unread below. Trading windows confirmed with the owner: Brunch
+   10:00-11:30, Lunch 11:30-16:00, Dinner 17:00-21:00 (venue local time);
+   anything outside those buckets into "Other" rather than dropped silently. */
+const DAYPARTS = [
+  { key: 'brunch', label: 'Brunch (10:00-11:30)', startMin: 10 * 60, endMin: 11 * 60 + 30 },
+  { key: 'lunch', label: 'Lunch (11:30-16:00)', startMin: 11 * 60 + 30, endMin: 16 * 60 },
+  { key: 'dinner', label: 'Dinner (17:00-21:00)', startMin: 17 * 60, endMin: 21 * 60 }
+];
+
+async function squareFetchOrdersFull(env, fromStr, toStr, tz, rollover) {
+  const locs = await squareActiveLocations(env);
+  const locationIds = locs.map((l) => l.id).slice(0, 10);
+  if (!locationIds.length) return [];
+  const [y1, m1, d1] = fromStr.split('-').map(Number);
+  const [y2, m2, d2] = toStr.split('-').map(Number);
+  const startMs = zonedWallTimeToUtcMs(y1, m1, d1, rollover, 0, 0, tz);
+  const endParts = addDaysUTCDateParts(y2, m2, d2, 1);
+  const endMs = zonedWallTimeToUtcMs(endParts.y, endParts.m, endParts.d, rollover, 0, 0, tz);
+  let cursor;
+  const out = [];
+  do {
+    const body = {
+      return_entries: false,
+      limit: 500,
+      location_ids: locationIds,
+      query: {
+        filter: {
+          date_time_filter: { closed_at: { start_at: new Date(startMs).toISOString(), end_at: new Date(endMs).toISOString() } },
+          state_filter: { states: ['COMPLETED'] }
+        }
+      }
+    };
+    if (cursor) body.cursor = cursor;
+    const data = await squareApiFetch(env, 'POST', '/v2/orders/search', body);
+    for (const o of (data.orders || [])) {
+      out.push({
+        closed_at: o.closed_at || o.created_at,
+        /* name + quantity only - no *_money field is ever copied out of `o` */
+        line_items: (o.line_items || []).map((li) => ({ name: li.name || 'Unnamed item', quantity: parseFloat(li.quantity) || 0 }))
+      });
+    }
+    cursor = data.cursor;
+  } while (cursor);
+  return out;
+}
+
+function minutesInTz(iso, tz) {
+  const dtf = new Intl.DateTimeFormat('en-US', { timeZone: tz, hourCycle: 'h23', hour: '2-digit', minute: '2-digit' });
+  const parts = dtf.formatToParts(new Date(iso));
+  const map = {};
+  for (const p of parts) map[p.type] = p.value;
+  return (+map.hour) * 60 + (+map.minute);
+}
+
+async function apiDayparts(env, url) {
+  const cur = parseRange(url.searchParams.get('cur'));
+  if (!cur) return json({ error: 'bad cur range' }, 400);
+  const tz = url.searchParams.get('tz') || 'Australia/Sydney';
+  const rollover = Math.max(0, Math.min(6, parseInt(url.searchParams.get('rollover') || '0', 10) || 0));
+  if (!ADAPTERS.pos.configured || !env.POS_API_TOKEN) return json({ configured: false });
+  try {
+    const orders = await squareFetchOrdersFull(env, cur.from, cur.to, tz, rollover);
+    const counts = {};
+    DAYPARTS.forEach((d) => { counts[d.key] = 0; });
+    let other = 0;
+    for (const o of orders) {
+      const mins = minutesInTz(o.closed_at, tz);
+      const bucket = DAYPARTS.find((d) => mins >= d.startMin && mins < d.endMin);
+      if (bucket) counts[bucket.key]++; else other++;
+    }
+    return json({ configured: true, dayparts: DAYPARTS.map((d) => ({ key: d.key, label: d.label, count: counts[d.key] })), other });
+  } catch (err) {
+    return json({ configured: true, error: plainError(err.status || 500) }, 200);
+  }
+}
+
+async function apiSellers(env, url) {
+  const cur = parseRange(url.searchParams.get('cur'));
+  if (!cur) return json({ error: 'bad cur range' }, 400);
+  const tz = url.searchParams.get('tz') || 'Australia/Sydney';
+  const rollover = Math.max(0, Math.min(6, parseInt(url.searchParams.get('rollover') || '0', 10) || 0));
+  if (!ADAPTERS.pos.configured || !env.POS_API_TOKEN) return json({ configured: false });
+  try {
+    const orders = await squareFetchOrdersFull(env, cur.from, cur.to, tz, rollover);
+    const qty = {};
+    for (const o of orders) for (const li of o.line_items) qty[li.name] = (qty[li.name] || 0) + li.quantity;
+    const items = Object.keys(qty)
+      .map((name) => ({ name, qty: Math.round(qty[name] * 100) / 100 }))
+      .sort((a, b) => b.qty - a.qty);
+    return json({ configured: true, items });
+  } catch (err) {
+    return json({ configured: true, error: plainError(err.status || 500) }, 200);
+  }
+}
+
 async function apiMetrics(env, url) {
   const cur = parseRange(url.searchParams.get('cur'));
   if (!cur) return json({ error: 'bad cur range' }, 400);
@@ -1047,6 +1148,14 @@ export default {
     if (path === '/api/covers' && request.method === 'POST') {
       if (!loggedIn) return json({ error: 'auth' }, 401);
       return apiCovers(env, request);
+    }
+    if (path === '/api/extras/dayparts' && request.method === 'GET') {
+      if (!loggedIn) return json({ error: 'auth' }, 401);
+      return apiDayparts(env, url);
+    }
+    if (path === '/api/extras/sellers' && request.method === 'GET') {
+      if (!loggedIn) return json({ error: 'auth' }, 401);
+      return apiSellers(env, url);
     }
     const authRoute = /^\/auth\/(accounting|pos|rostering)\/(start|callback)$/.exec(path);
     if (authRoute && request.method === 'GET') {
