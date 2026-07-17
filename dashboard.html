@@ -901,7 +901,7 @@ function renderDashboard(root) {
 }
 
 function extrasApiUrl(path, r) {
-  return path + '?cur=' + r.from + ':' + r.to
+  return path + '?cur=' + iso(r.from) + ':' + iso(r.to)
     + '&tz=' + encodeURIComponent(SETTINGS.timezone)
     + '&rollover=' + (+SETTINGS.rolloverHour || 0);
 }
