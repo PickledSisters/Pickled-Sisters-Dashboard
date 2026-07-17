@@ -960,39 +960,58 @@ function daypartExtraCard(r) {
   return wrap;
 }
 
+function sellerList(title, rows) {
+  var section = el('div', '');
+  section.style.marginTop = '0.6rem';
+  section.appendChild(el('div', 'conn-line', title));
+  if (!rows.length) {
+    var none = el('div', 'conn-line');
+    none.style.color = 'var(--muted)';
+    none.textContent = 'Nothing here for this period.';
+    section.appendChild(none);
+    return section;
+  }
+  var ol = document.createElement('ol');
+  ol.style.cssText = 'margin:0.3rem 0 0;padding-left:1.3rem;font-size:13px;color:var(--text-body);';
+  rows.forEach(function (i) {
+    var li = document.createElement('li');
+    li.style.padding = '2px 0';
+    li.textContent = esc(i.name) + ' — ' + i.qty + (i.qty === 1 ? ' unit' : ' units');
+    ol.appendChild(li);
+  });
+  section.appendChild(ol);
+  return section;
+}
+
 function sellersExtraCard(r) {
   var wrap = el('div', 'mcard fade-in');
   wrap.style.marginTop = '1rem';
-  wrap.appendChild(el('div', 'm-label', 'Top and bottom sellers · extra, units sold from Square'));
+  wrap.appendChild(el('div', 'm-label', 'Top and bottom sellers · extra, units sold from Square, split Food / Beverage'));
   var body = el('div', 'm-def', 'Loading…');
   wrap.appendChild(body);
   fetch(extrasApiUrl('/api/extras/sellers', r)).then(function (res) { return res.json(); }).then(function (j) {
     body.innerHTML = '';
     if (!j.configured) { body.textContent = 'Not configured — connect Square first.'; return; }
     if (j.error) { body.textContent = j.error; return; }
-    var items = j.items || [];
-    if (!items.length) { body.textContent = 'No sales items found for this period.'; return; }
-    var top = items.slice(0, 5);
-    var bottom = items.slice(-5).reverse();
 
-    function sellerList(title, rows) {
-      var section = el('div', '');
-      section.style.marginTop = '0.6rem';
-      section.appendChild(el('div', 'conn-line', title));
-      var ol = document.createElement('ol');
-      ol.style.cssText = 'margin:0.3rem 0 0;padding-left:1.3rem;font-size:13px;color:var(--text-body);';
-      rows.forEach(function (i) {
-        var li = document.createElement('li');
-        li.style.padding = '2px 0';
-        li.textContent = esc(i.name) + ' — ' + i.qty + (i.qty === 1 ? ' unit' : ' units');
-        ol.appendChild(li);
-      });
-      section.appendChild(ol);
-      return section;
+    var food = j.food || [], bev = j.beverage || [], other = j.other || [];
+
+    body.appendChild(el('div', 'm-label', 'Food'));
+    body.appendChild(sellerList('Top 10 sellers', food.slice(0, 10)));
+    body.appendChild(sellerList('Bottom 10 (slow movers)', food.slice(-10).reverse()));
+
+    var bevHead = el('div', 'm-label', 'Beverage');
+    bevHead.style.marginTop = '1rem';
+    body.appendChild(bevHead);
+    body.appendChild(sellerList('Top 10 sellers', bev.slice(0, 10)));
+    body.appendChild(sellerList('Bottom 10 (slow movers)', bev.slice(-10).reverse()));
+
+    if (other.length) {
+      var otherHead = el('div', 'm-label', 'Uncategorised — check these items’ category in Square');
+      otherHead.style.marginTop = '1rem';
+      body.appendChild(otherHead);
+      body.appendChild(sellerList('Items', other.slice(0, 10)));
     }
-
-    body.appendChild(sellerList('Top sellers', top));
-    body.appendChild(sellerList('Slow movers', bottom));
   }).catch(function () { body.textContent = 'Could not load sellers data just now.'; });
   return wrap;
 }
