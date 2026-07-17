@@ -891,6 +891,30 @@ async function fetchSlot(env, q) {
 
 const METRICS_CACHE_TTL = 120; /* seconds: brief cache for live provider data */
 
+/* Extra: Spend per cover (covers typed in daily) - see coversExtraCard in
+   dashboard.html and apiCovers below. Not one of kpi-spec.md's locked seven;
+   added as its own clearly-labelled figure per the owner's request. */
+async function coversSumFor(env, range) {
+  const r = await readIngested(env, 'covers', range.from, range.to);
+  return r.daysWithData ? (r.sums.covers || 0) : null;
+}
+
+/* POST /api/covers - session-cookie auth (the owner typing into their own
+   logged-in dashboard), body { date:'YYYY-MM-DD', covers:number }. Stored via
+   the same generic day-store saveIngestedRows() already used by the file-
+   upload rungs; same-day re-saves overwrite, so correcting a day is safe. */
+async function apiCovers(env, request) {
+  let body; try { body = await request.json(); } catch (e) { return json({ ok: false }, 400); }
+  const date = String((body && body.date) || '');
+  const covers = Number(body && body.covers);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !isFinite(covers) || covers < 0) {
+    return json({ ok: false, error: 'bad input' }, 400);
+  }
+  await saveIngestedRows(env, 'covers', [{ date, covers }]);
+  await noteSync(env, 'covers');
+  return json({ ok: true });
+}
+
 async function apiMetrics(env, url) {
   const cur = parseRange(url.searchParams.get('cur'));
   if (!cur) return json({ error: 'bad cur range' }, 400);
@@ -928,6 +952,15 @@ async function apiMetrics(env, url) {
     periods.cur = await fetchSlot(env, { ...base, ...cur });
     periods.prev = prev ? await fetchSlot(env, { ...base, ...prev }) : null;
     periods.yoy = yoy ? await fetchSlot(env, { ...base, ...yoy }) : null;
+
+    /* Extra: covers, typed in daily by the owner (Nowbookit has no self-serve
+       API - see the conversation, not kpi-spec.md). Reuses the same generic
+       day-store as the ingest rungs (source string 'covers'), completely
+       outside the ADAPTERS/accounting/pos/rostering machinery. null (not 0)
+       when nothing has been entered for the period yet - never a fake zero. */
+    periods.cur.covers = await coversSumFor(env, cur);
+    if (periods.prev) periods.prev.covers = await coversSumFor(env, prev);
+    if (periods.yoy) periods.yoy.covers = await coversSumFor(env, yoy);
 
     let trendOut = null;
     if (trend) {
@@ -1010,6 +1043,10 @@ export default {
     if (path === '/api/metrics' && request.method === 'GET') {
       if (!loggedIn) return json({ error: 'auth' }, 401);
       return apiMetrics(env, url);
+    }
+    if (path === '/api/covers' && request.method === 'POST') {
+      if (!loggedIn) return json({ error: 'auth' }, 401);
+      return apiCovers(env, request);
     }
     const authRoute = /^\/auth\/(accounting|pos|rostering)\/(start|callback)$/.exec(path);
     if (authRoute && request.method === 'GET') {

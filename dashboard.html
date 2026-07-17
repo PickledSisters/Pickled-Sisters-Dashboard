@@ -886,6 +886,71 @@ function renderDashboard(root) {
   var cur = periodValues('cur'), prev = periodValues('prev'), yoy = periodValues('yoy');
   CHOSEN.forEach(function (k) { grid.appendChild(metricCard(k, cur, prev, yoy, r)); });
   root.appendChild(grid);
+
+  /* Extra: Spend per cover - NOT one of the seven locked metrics above.
+     Added at the owner's request; covers are typed in daily (Nowbookit has
+     no self-serve API), kept as its own clearly-labelled figure so it never
+     gets confused with the core, reconciled board. */
+  root.appendChild(coversExtraCard(cur, r));
+}
+
+function coversValue(slot) {
+  var d = state.data;
+  if (!d || !d.periods || !d.periods[slot]) return null;
+  var v = d.periods[slot].covers;
+  return (typeof v === 'number' && isFinite(v)) ? v : null;
+}
+
+function coversExtraCard(cur, r) {
+  var wrap = el('div', 'mcard fade-in');
+  wrap.style.marginTop = '1rem';
+  wrap.appendChild(el('div', 'm-label', 'Spend per cover · extra, not one of the core six'));
+
+  var covers = coversValue('cur');
+  var revenue = cur.revenue;
+  if (covers == null) {
+    wrap.appendChild(el('div', 'm-value dim', 'Not configured'));
+    wrap.appendChild(el('div', 'm-def', 'Enter covers below for this period to switch this on.'));
+  } else if (revenue == null) {
+    wrap.appendChild(el('div', 'm-value dim', 'Not configured'));
+    wrap.appendChild(el('div', 'm-def', 'Needs Xero revenue for this period too.'));
+  } else if (covers === 0) {
+    wrap.appendChild(el('div', 'm-value', '—'));
+  } else {
+    wrap.appendChild(el('div', 'm-value', fmtMoney(revenue / covers, false)));
+    wrap.appendChild(el('div', 'm-def', 'Revenue ÷ covers · ' + covers + ' covers entered for ' + fmtRange(r)));
+  }
+
+  var form = el('div', 'conn-actions');
+  form.style.marginTop = '0.8rem';
+  var dateIn = document.createElement('input');
+  dateIn.type = 'date';
+  dateIn.value = new Date().toISOString().slice(0, 10);
+  var numIn = document.createElement('input');
+  numIn.type = 'number'; numIn.min = '0'; numIn.placeholder = 'Covers count';
+  numIn.style.cssText = 'font-family:DM Sans,sans-serif;font-size:13px;padding:7px 10px;border:1px solid var(--border-med);border-radius:8px;width:110px;';
+  var saveBtn = el('button', 'btn-small', 'Save covers for that day');
+  var msg = el('div', 'conn-line');
+  msg.style.marginTop = '0.4rem';
+  saveBtn.onclick = function () {
+    var dv = dateIn.value, n = parseInt(numIn.value, 10);
+    if (!dv || !isFinite(n) || n < 0) { msg.textContent = 'Enter a date and a covers count of 0 or more.'; return; }
+    saveBtn.disabled = true; msg.textContent = 'Saving…';
+    fetch('/api/covers', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ date: dv, covers: n }) })
+      .then(function (res) { return res.json().then(function (j) { return { ok: res.ok, j: j }; }); })
+      .then(function (out) {
+        saveBtn.disabled = false;
+        if (out.ok) { msg.textContent = 'Saved for ' + dv + '.'; numIn.value = ''; fetchData(true); }
+        else { msg.textContent = 'Could not save that. Try again.'; }
+      })
+      .catch(function () { saveBtn.disabled = false; msg.textContent = 'Something went wrong. Try again.'; });
+  };
+  form.appendChild(dateIn);
+  form.appendChild(numIn);
+  form.appendChild(saveBtn);
+  wrap.appendChild(form);
+  wrap.appendChild(msg);
+  return wrap;
 }
 
 function periodLabel() {
