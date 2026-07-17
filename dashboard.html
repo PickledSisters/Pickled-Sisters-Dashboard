@@ -752,7 +752,7 @@ function render() {
   var nav = el('div', 'nav');
   var tabs = isManual()
     ? [ { key: 'dashboard', label: 'Dashboard' }, { key: 'enter', label: 'Enter numbers' }, { key: 'settings', label: 'Settings' } ]
-    : [ { key: 'dashboard', label: 'Dashboard' }, { key: 'connections', label: 'Connections' }, { key: 'recon', label: 'Check your numbers' }, { key: 'settings', label: 'Settings' } ];
+    : [ { key: 'dashboard', label: 'Dashboard' }, { key: 'overview', label: 'Overview' }, { key: 'connections', label: 'Connections' }, { key: 'recon', label: 'Check your numbers' }, { key: 'settings', label: 'Settings' } ];
   tabs.forEach(function (t) {
     var b = el('button', 'nav-tab' + (state.view === t.key ? ' active' : ''));
     b.innerHTML = t.label + ((t.key === 'recon' && anyConfiguredSource() && unconfirmedConnectedMetrics().length) ? '<span class="dot"></span>' : '');
@@ -784,9 +784,10 @@ function render() {
     root.appendChild(pwb);
   }
 
-  if (isManual() && (state.view === 'connections' || state.view === 'recon')) state.view = 'dashboard';
+  if (isManual() && (state.view === 'connections' || state.view === 'recon' || state.view === 'overview')) state.view = 'dashboard';
   if (state.view === 'dashboard') renderDashboard(root);
   else if (state.view === 'enter') renderManualEntry(root);
+  else if (state.view === 'overview') renderOverview(root);
   else if (state.view === 'connections') renderConnections(root);
   else if (state.view === 'recon') renderRecon(root);
   else renderSettings(root);
@@ -1024,6 +1025,218 @@ function coversExtraCard(cur, r) {
   wrap.appendChild(form);
   wrap.appendChild(msg);
   return wrap;
+}
+
+/* ---------- Overview view (extra: same reconciled figures, different view) ----
+   Not a new data source or a new locked metric - purely a different display of
+   numbers already computed on the Dashboard tab (periodValues / profitDollars),
+   added at the owner's request after seeing another member's build. */
+function renderOverview(root) {
+  var r = resolvePeriod(state.period, state.customFrom, state.customTo);
+  root.appendChild(el('div', 'screen-title', 'Overview'));
+  root.appendChild(el('p', 'screen-sub', 'The big picture at a glance, drawn from the same figures as your Dashboard cards. Change the period on the Dashboard tab and these follow.'));
+
+  var cur = periodValues('cur');
+  if (!isConfigured('accounting') || cur.revenue == null) {
+    root.appendChild(el('div', 'banner banner-amber', 'Connect Xero (and reconcile) to see this overview - it uses the same figures as your Dashboard cards.'));
+    return;
+  }
+  var profit = profitDollars(cur);
+
+  var grid = el('div', 'cards');
+  grid.appendChild(donutCard(cur, profit));
+  grid.appendChild(ratiosCard(cur, profit));
+  root.appendChild(grid);
+
+  var combo = comboCard();
+  if (combo) root.appendChild(combo);
+}
+
+function donutCard(cur, profit) {
+  var card = el('div', 'mcard fade-in');
+  card.appendChild(el('div', 'm-label', 'Where each dollar goes'));
+  card.appendChild(el('div', 'm-def', 'Your revenue split into cost of goods, wages, overheads and what is left as profit.'));
+  var parts = [
+    { label: 'Cost of goods', value: Math.max(0, cur.cogs || 0), color: 'var(--c-coral)' },
+    { label: 'Wages + super', value: Math.max(0, cur.wagesSuper || 0), color: 'var(--c-blue)' },
+    { label: 'Overheads', value: Math.max(0, cur.overheads || 0), color: 'var(--c-amber)' },
+    { label: 'Profit', value: Math.max(0, profit || 0), color: 'var(--c-green)' }
+  ];
+  var total = cur.revenue || 0;
+  card.appendChild(donutSvg(parts, total, fmtMoney(cur.revenue, false)));
+  var legend = el('div', '');
+  legend.style.cssText = 'margin-top:0.9rem;display:flex;flex-direction:column;gap:7px;font-size:12px;';
+  parts.forEach(function (p) {
+    var row = el('div', '');
+    row.style.cssText = 'display:flex;align-items:center;gap:8px;';
+    var dot = el('span', '');
+    dot.style.cssText = 'width:9px;height:9px;border-radius:50%;background:' + p.color + ';display:inline-block;flex:none;';
+    row.appendChild(dot);
+    var pct = total > 0 ? (p.value / total * 100) : 0;
+    row.appendChild(el('span', '', esc(p.label) + ' — ' + fmtMoney(p.value, false) + ' (' + pct.toFixed(1) + '%)'));
+    legend.appendChild(row);
+  });
+  card.appendChild(legend);
+  return card;
+}
+
+function donutSvg(parts, total, centerLabel) {
+  var NS = 'http://www.w3.org/2000/svg';
+  var r = 70, cx = 100, cy = 100, sw = 26, C = 2 * Math.PI * r;
+  var svg = document.createElementNS(NS, 'svg');
+  svg.setAttribute('viewBox', '0 0 200 200');
+  svg.style.cssText = 'display:block;width:180px;height:180px;margin:0.6rem auto 0;';
+  var bg = document.createElementNS(NS, 'circle');
+  bg.setAttribute('cx', cx); bg.setAttribute('cy', cy); bg.setAttribute('r', r);
+  bg.setAttribute('fill', 'none'); bg.setAttribute('stroke', 'rgba(255,255,255,0.08)'); bg.setAttribute('stroke-width', sw);
+  svg.appendChild(bg);
+  var offset = 0;
+  parts.forEach(function (p) {
+    var frac = total > 0 ? p.value / total : 0;
+    var len = frac * C;
+    if (len <= 0) return;
+    var seg = document.createElementNS(NS, 'circle');
+    seg.setAttribute('cx', cx); seg.setAttribute('cy', cy); seg.setAttribute('r', r);
+    seg.setAttribute('fill', 'none');
+    seg.setAttribute('stroke', p.color);
+    seg.setAttribute('stroke-width', sw);
+    seg.setAttribute('stroke-dasharray', len.toFixed(1) + ' ' + (C - len).toFixed(1));
+    seg.setAttribute('stroke-dashoffset', (-offset).toFixed(1));
+    seg.setAttribute('transform', 'rotate(-90 ' + cx + ' ' + cy + ')');
+    svg.appendChild(seg);
+    offset += len;
+  });
+  var wrap = el('div', '');
+  wrap.style.cssText = 'position:relative;';
+  wrap.appendChild(svg);
+  var center = el('div', '');
+  center.style.cssText = 'position:absolute;top:44%;left:50%;transform:translate(-50%,-50%);text-align:center;pointer-events:none;';
+  center.innerHTML = '<div style="font-size:17px;font-weight:700;">' + esc(centerLabel) + '</div><div style="font-size:10px;color:var(--muted);margin-top:2px;">Revenue</div>';
+  wrap.appendChild(center);
+  return wrap;
+}
+
+function ratioRow(label, pct, color) {
+  var row = el('div', '');
+  row.style.marginBottom = '12px';
+  var top = el('div', '');
+  top.style.cssText = 'display:flex;justify-content:space-between;font-size:12px;color:var(--muted);margin-bottom:4px;';
+  top.innerHTML = '<span>' + esc(label) + '</span><span>' + pct.toFixed(1) + '%</span>';
+  var barBg = el('div', '');
+  barBg.style.cssText = 'height:8px;border-radius:4px;background:rgba(255,255,255,0.08);overflow:hidden;';
+  var barFill = el('div', '');
+  barFill.style.cssText = 'height:100%;border-radius:4px;background:' + color + ';width:' + Math.max(0, Math.min(100, pct)).toFixed(1) + '%;';
+  barBg.appendChild(barFill);
+  row.appendChild(top);
+  row.appendChild(barBg);
+  return row;
+}
+
+function ratiosCard(cur, profit) {
+  var card = el('div', 'mcard fade-in');
+  card.appendChild(el('div', 'm-label', 'Profitability ratios'));
+  card.appendChild(el('div', 'm-def', 'Each as a share of revenue. Wages and overheads are costs, so lower is better there.'));
+  var rev = cur.revenue || 0;
+  var rows = [
+    { label: 'Gross margin', pct: rev ? ((rev - (cur.cogs || 0)) / rev * 100) : 0, color: 'var(--c-green)' },
+    { label: 'Wages + super', pct: rev ? ((cur.wagesSuper || 0) / rev * 100) : 0, color: 'var(--c-blue)' },
+    { label: 'Overheads', pct: rev ? ((cur.overheads || 0) / rev * 100) : 0, color: 'var(--c-amber)' },
+    { label: 'Net profit margin', pct: rev ? ((profit || 0) / rev * 100) : 0, color: 'var(--c-green)' }
+  ];
+  var body = el('div', '');
+  body.style.marginTop = '0.9rem';
+  rows.forEach(function (row) { body.appendChild(ratioRow(row.label, row.pct, row.color)); });
+  card.appendChild(body);
+  return card;
+}
+
+function comboChart() {
+  var t = state.data && state.data.trend;
+  if (!t || !t.accounting) return null;
+  var months = t.months || [];
+  var rev = (t.accounting.revenue || []).slice();
+  var cogsArr = (t.accounting.cogs || []).slice();
+  var wsArr = (t.accounting.wagesSuper || []).slice();
+  var ohArr = (t.accounting.overheads || []).slice();
+  var n = months.length, start = Math.max(0, n - 12);
+  months = months.slice(start); rev = rev.slice(start);
+  cogsArr = cogsArr.slice(start); wsArr = wsArr.slice(start); ohArr = ohArr.slice(start);
+  var profit = rev.map(function (v, i) {
+    if (v == null || cogsArr[i] == null || wsArr[i] == null || ohArr[i] == null) return null;
+    return v - cogsArr[i] - wsArr[i] - ohArr[i];
+  });
+  var shownRev = rev.filter(function (x) { return x != null; });
+  var shownProfit = profit.filter(function (x) { return x != null; });
+  if (!shownRev.length) return null;
+
+  var maxV = Math.max.apply(null, shownRev.concat(shownProfit).concat([0]));
+  var minV = Math.min.apply(null, shownProfit.concat([0]));
+  var span = (maxV - minV) || 1;
+  var W = 700, H = 160, gap = 6, NS = 'http://www.w3.org/2000/svg';
+  var bw = (W - gap * (rev.length - 1)) / rev.length;
+  var zeroY = H - ((0 - minV) / span) * H;
+
+  var svg = document.createElementNS(NS, 'svg');
+  svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
+  svg.setAttribute('preserveAspectRatio', 'none');
+  svg.style.cssText = 'display:block;width:100%;height:180px';
+
+  for (var i = 0; i < rev.length; i++) {
+    if (rev[i] == null) continue;
+    var x = i * (bw + gap);
+    var vy = H - ((rev[i] - minV) / span) * H;
+    var top = Math.min(vy, zeroY), h = Math.max(1.5, Math.abs(zeroY - vy));
+    var rect = document.createElementNS(NS, 'rect');
+    rect.setAttribute('x', x.toFixed(1));
+    rect.setAttribute('y', top.toFixed(1));
+    rect.setAttribute('width', bw.toFixed(1));
+    rect.setAttribute('height', h.toFixed(1));
+    rect.setAttribute('rx', '2');
+    rect.setAttribute('fill', 'var(--accent)');
+    rect.setAttribute('opacity', '0.85');
+    rect.setAttribute('data-lab', months[i] + ' · Revenue ' + fmtMoney(rev[i], false) + (profit[i] != null ? ' · Profit ' + fmtMoney(profit[i], false) : ''));
+    svg.appendChild(rect);
+  }
+
+  var pts = [];
+  for (var j = 0; j < profit.length; j++) {
+    if (profit[j] == null) continue;
+    var px = j * (bw + gap) + bw / 2;
+    var py = H - ((profit[j] - minV) / span) * H;
+    pts.push({ x: px, y: py });
+  }
+  if (pts.length > 1) {
+    var poly = document.createElementNS(NS, 'polyline');
+    poly.setAttribute('points', pts.map(function (p) { return p.x.toFixed(1) + ',' + p.y.toFixed(1); }).join(' '));
+    poly.setAttribute('fill', 'none');
+    poly.setAttribute('stroke', 'var(--c-green)');
+    poly.setAttribute('stroke-width', '2.5');
+    svg.appendChild(poly);
+  }
+  pts.forEach(function (p) {
+    var dot = document.createElementNS(NS, 'circle');
+    dot.setAttribute('cx', p.x.toFixed(1));
+    dot.setAttribute('cy', p.y.toFixed(1));
+    dot.setAttribute('r', '2.5');
+    dot.setAttribute('fill', 'var(--c-green)');
+    svg.appendChild(dot);
+  });
+
+  var holder = el('div', 'tbars-svg');
+  holder.appendChild(svg);
+  attachBarTip(holder);
+  return holder;
+}
+
+function comboCard() {
+  var chart = comboChart();
+  if (!chart) return null;
+  var card = el('div', 'mcard fade-in');
+  card.style.marginTop = '1rem';
+  card.appendChild(el('div', 'm-label', 'Revenue and profit trend'));
+  card.appendChild(el('div', 'm-def', 'Monthly revenue bars with the profit line over the top, last 12 months.'));
+  card.appendChild(chart);
+  return card;
 }
 
 function periodLabel() {
