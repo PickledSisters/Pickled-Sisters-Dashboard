@@ -752,7 +752,7 @@ function render() {
   var nav = el('div', 'nav');
   var tabs = isManual()
     ? [ { key: 'dashboard', label: 'Dashboard' }, { key: 'enter', label: 'Enter numbers' }, { key: 'settings', label: 'Settings' } ]
-    : [ { key: 'dashboard', label: 'Dashboard' }, { key: 'overview', label: 'Overview' }, { key: 'connections', label: 'Connections' }, { key: 'recon', label: 'Check your numbers' }, { key: 'settings', label: 'Settings' } ];
+    : [ { key: 'dashboard', label: 'Dashboard' }, { key: 'connections', label: 'Connections' }, { key: 'recon', label: 'Check your numbers' }, { key: 'settings', label: 'Settings' } ];
   tabs.forEach(function (t) {
     var b = el('button', 'nav-tab' + (state.view === t.key ? ' active' : ''));
     b.innerHTML = t.label + ((t.key === 'recon' && anyConfiguredSource() && unconfirmedConnectedMetrics().length) ? '<span class="dot"></span>' : '');
@@ -784,10 +784,9 @@ function render() {
     root.appendChild(pwb);
   }
 
-  if (isManual() && (state.view === 'connections' || state.view === 'recon' || state.view === 'overview')) state.view = 'dashboard';
+  if (isManual() && (state.view === 'connections' || state.view === 'recon')) state.view = 'dashboard';
   if (state.view === 'dashboard') renderDashboard(root);
   else if (state.view === 'enter') renderManualEntry(root);
-  else if (state.view === 'overview') renderOverview(root);
   else if (state.view === 'connections') renderConnections(root);
   else if (state.view === 'recon') renderRecon(root);
   else renderSettings(root);
@@ -899,6 +898,21 @@ function renderDashboard(root) {
      CLAUDE.md rule 2). Not part of kpi-spec.md's locked six/seven. */
   root.appendChild(daypartExtraCard(r));
   root.appendChild(sellersExtraCard(r));
+
+  /* Extra: the "Overview" visuals (donut, ratios, combined trend chart) -
+     same reconciled Xero figures as the cards above, just a different view.
+     Originally its own tab, folded into the Dashboard tab at the owner's
+     request so everything sits in one place. */
+  if (isConfigured('accounting') && cur.revenue != null) {
+    var profit = profitDollars(cur);
+    var ovGrid = el('div', 'cards');
+    ovGrid.style.marginTop = '1rem';
+    ovGrid.appendChild(donutCard(cur, profit));
+    ovGrid.appendChild(ratiosCard(cur, profit));
+    root.appendChild(ovGrid);
+    var combo = comboCard();
+    if (combo) root.appendChild(combo);
+  }
 }
 
 function extrasApiUrl(path, r) {
@@ -1025,31 +1039,6 @@ function coversExtraCard(cur, r) {
   wrap.appendChild(form);
   wrap.appendChild(msg);
   return wrap;
-}
-
-/* ---------- Overview view (extra: same reconciled figures, different view) ----
-   Not a new data source or a new locked metric - purely a different display of
-   numbers already computed on the Dashboard tab (periodValues / profitDollars),
-   added at the owner's request after seeing another member's build. */
-function renderOverview(root) {
-  var r = resolvePeriod(state.period, state.customFrom, state.customTo);
-  root.appendChild(el('div', 'screen-title', 'Overview'));
-  root.appendChild(el('p', 'screen-sub', 'The big picture at a glance, drawn from the same figures as your Dashboard cards. Change the period on the Dashboard tab and these follow.'));
-
-  var cur = periodValues('cur');
-  if (!isConfigured('accounting') || cur.revenue == null) {
-    root.appendChild(el('div', 'banner banner-amber', 'Connect Xero (and reconcile) to see this overview - it uses the same figures as your Dashboard cards.'));
-    return;
-  }
-  var profit = profitDollars(cur);
-
-  var grid = el('div', 'cards');
-  grid.appendChild(donutCard(cur, profit));
-  grid.appendChild(ratiosCard(cur, profit));
-  root.appendChild(grid);
-
-  var combo = comboCard();
-  if (combo) root.appendChild(combo);
 }
 
 function donutCard(cur, profit) {
