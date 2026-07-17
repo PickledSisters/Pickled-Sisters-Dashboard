@@ -881,9 +881,24 @@ function renderDashboard(root) {
     root.appendChild(mb);
   }
 
+  var cur = periodValues('cur'), prev = periodValues('prev'), yoy = periodValues('yoy');
+
+  /* Extra: the "Overview" visuals (donut, ratios, combined trend chart) -
+     same reconciled Xero figures as the cards below, just a different view.
+     Placed at the top, above the cards, at the owner's request. */
+  if (isConfigured('accounting') && cur.revenue != null) {
+    var profit = profitDollars(cur);
+    var ovGrid = el('div', 'cards');
+    ovGrid.appendChild(donutCard(cur, profit));
+    ovGrid.appendChild(ratiosCard(cur, profit));
+    root.appendChild(ovGrid);
+    var combo = comboCard();
+    if (combo) root.appendChild(combo);
+  }
+
   /* Cards */
   var grid = el('div', 'cards');
-  var cur = periodValues('cur'), prev = periodValues('prev'), yoy = periodValues('yoy');
+  grid.style.marginTop = '1rem';
   CHOSEN.forEach(function (k) { grid.appendChild(metricCard(k, cur, prev, yoy, r)); });
   root.appendChild(grid);
 
