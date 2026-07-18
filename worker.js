@@ -925,9 +925,9 @@ async function apiCovers(env, request) {
    10:00-11:30, Lunch 11:30-16:00, Dinner 17:00-21:00 (venue local time);
    anything outside those buckets into "Other" rather than dropped silently. */
 const DAYPARTS = [
-  { key: 'brunch', label: 'Brunch (10:00-11:30)', startMin: 10 * 60, endMin: 11 * 60 + 30 },
+  { key: 'brunch', label: 'Brunch (09:00-11:30)', startMin: 9 * 60, endMin: 11 * 60 + 30 },
   { key: 'lunch', label: 'Lunch (11:30-16:00)', startMin: 11 * 60 + 30, endMin: 16 * 60 },
-  { key: 'dinner', label: 'Dinner (17:00-21:00)', startMin: 17 * 60, endMin: 21 * 60 }
+  { key: 'dinner', label: 'Dinner (17:00-23:00)', startMin: 17 * 60, endMin: 23 * 60 }
 ];
 
 async function squareFetchOrdersFull(env, fromStr, toStr, tz, rollover) {
