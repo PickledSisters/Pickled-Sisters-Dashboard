@@ -890,18 +890,6 @@ function renderDashboard(root) {
      target breach (targets already live in Settings), instead of having to
      spot it card by card. */
   var breaches = breachedTargets(cur);
-  if (breaches.length) {
-    var ab = el('div', 'banner banner-coral');
-    ab.innerHTML = '<b>' + breaches.length + (breaches.length === 1 ? ' number needs' : ' numbers need') + ' attention:</b> ' +
-      breaches.map(function (b) { return esc(b.label) + ' at ' + fmtPctVal(b.value); }).join(', ') + '.';
-    root.appendChild(ab);
-  }
-
-  /* Extra: this week's actions + last week's "did it work" - the owner's own
-     notes, always tied to the calendar week regardless of which period is
-     selected above. Client-side only (like Settings/targets), no server
-     round-trip needed. */
-  root.appendChild(actionsCard());
 
   /* Extra: the "Overview" visuals (donut, ratios, combined trend charts) -
      same reconciled Xero figures as the cards below, just a different view.
@@ -924,6 +912,22 @@ function renderDashboard(root) {
   CHOSEN.forEach(function (k) { grid.appendChild(metricCard(k, cur, prev, yoy, r)); });
   root.appendChild(grid);
 
+  /* Extra: alert banner - a single "needs attention" line summarising any
+     target breach, placed below the numbers it refers to. */
+  if (breaches.length) {
+    var ab2 = el('div', 'banner banner-coral');
+    ab2.style.marginTop = '1rem';
+    ab2.innerHTML = '<b>' + breaches.length + (breaches.length === 1 ? ' number needs' : ' numbers need') + ' attention:</b> ' +
+      breaches.map(function (b) { return esc(b.label) + ' at ' + fmtPctVal(b.value); }).join(', ') + '.';
+    root.appendChild(ab2);
+  }
+
+  /* Extra: this week's actions + last week's "did it work" - the owner's own
+     notes, always tied to the calendar week regardless of which period is
+     selected above. Client-side only (like Settings/targets), no server
+     round-trip needed. */
+  root.appendChild(actionsCard());
+
   /* Extra: Spend per cover - NOT one of the seven locked metrics above.
      Added at the owner's request; covers are typed in daily (Nowbookit has
      no self-serve API), kept as its own clearly-labelled figure so it never
@@ -935,21 +939,6 @@ function renderDashboard(root) {
      CLAUDE.md rule 2). Not part of kpi-spec.md's locked six/seven. */
   root.appendChild(daypartExtraCard(r));
   root.appendChild(sellersExtraCard(r));
-
-  /* Extra: the "Overview" visuals (donut, ratios, combined trend chart) -
-     same reconciled Xero figures as the cards above, just a different view.
-     Originally its own tab, folded into the Dashboard tab at the owner's
-     request so everything sits in one place. */
-  if (isConfigured('accounting') && cur.revenue != null) {
-    var profit = profitDollars(cur);
-    var ovGrid = el('div', 'cards');
-    ovGrid.style.marginTop = '1rem';
-    ovGrid.appendChild(donutCard(cur, profit));
-    ovGrid.appendChild(ratiosCard(cur, profit));
-    root.appendChild(ovGrid);
-    var combo = comboCard();
-    if (combo) root.appendChild(combo);
-  }
 }
 
 function extrasApiUrl(path, r) {
@@ -1008,32 +997,17 @@ function sellerList(title, rows) {
 function sellersExtraCard(r) {
   var wrap = el('div', 'mcard fade-in');
   wrap.style.marginTop = '1rem';
-  wrap.appendChild(el('div', 'm-label', 'Top and bottom sellers · extra, units sold from Square, split Food / Beverage'));
+  wrap.appendChild(el('div', 'm-label', 'Top and bottom sellers · extra, units sold from Square'));
   var body = el('div', 'm-def', 'Loading…');
   wrap.appendChild(body);
   fetch(extrasApiUrl('/api/extras/sellers', r)).then(function (res) { return res.json(); }).then(function (j) {
     body.innerHTML = '';
     if (!j.configured) { body.textContent = 'Not configured — connect Square first.'; return; }
     if (j.error) { body.textContent = j.error; return; }
-
-    var food = j.food || [], bev = j.beverage || [], other = j.other || [];
-
-    body.appendChild(el('div', 'm-label', 'Food'));
-    body.appendChild(sellerList('Top 10 sellers', food.slice(0, 10)));
-    body.appendChild(sellerList('Bottom 10 (slow movers)', food.slice(-10).reverse()));
-
-    var bevHead = el('div', 'm-label', 'Beverage');
-    bevHead.style.marginTop = '1rem';
-    body.appendChild(bevHead);
-    body.appendChild(sellerList('Top 10 sellers', bev.slice(0, 10)));
-    body.appendChild(sellerList('Bottom 10 (slow movers)', bev.slice(-10).reverse()));
-
-    if (other.length) {
-      var otherHead = el('div', 'm-label', 'Uncategorised — check these items’ category in Square');
-      otherHead.style.marginTop = '1rem';
-      body.appendChild(otherHead);
-      body.appendChild(sellerList('Items', other.slice(0, 10)));
-    }
+    var items = j.items || [];
+    if (!items.length) { body.textContent = 'No sales items found for this period.'; return; }
+    body.appendChild(sellerList('Top 10 sellers', items.slice(0, 10)));
+    body.appendChild(sellerList('Bottom 10 (slow movers)', items.slice(-10).reverse()));
   }).catch(function () { body.textContent = 'Could not load sellers data just now.'; });
   return wrap;
 }

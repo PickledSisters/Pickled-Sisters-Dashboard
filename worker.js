@@ -1000,86 +1000,20 @@ async function apiDayparts(env, url) {
 /* Food vs Beverage grouping - confirmed directly with the owner (their actual
    Square category names, not guessed). Anything outside these lists goes to
    "other" so a miscategorised or new Square category is surfaced, never
-   silently dropped or wrongly bucketed. */
-const FOOD_CATEGORY_NAMES = ['lunch', 'brunch', 'desserts', 'pasta night', 'mains', 'starters', 'sides', 'to start and share', 'friday night menu', "children's menu", 'food'];
-const BEVERAGE_CATEGORY_NAMES = ['wine', 'wine by the glass', 'red wine', 'white wine', 'cocktails', 'spirits', 'spiritis', 'fortifieds', 'sparkling', 'non alcoholic', 'coffee/tea', 'beer'];
-
-function classifyCategoryName(name) {
-  const n = (name || '').toLowerCase().trim();
-  if (FOOD_CATEGORY_NAMES.includes(n)) return 'food';
-  if (BEVERAGE_CATEGORY_NAMES.includes(n)) return 'beverage';
-  return 'other';
-}
-
-/* Builds variation -> item -> category maps from Square's Catalog, so a line
-   item's catalog_object_id (an ITEM_VARIATION id) can be traced to its
-   category name. Paginated; a small venue's catalog is a handful of calls. */
-async function squareCatalogMaps(env) {
-  let cursor;
-  const variationToItem = {};
-  const itemCategoryIds = {};
-  const categoryName = {};
-  do {
-    const params = new URLSearchParams({ types: 'ITEM,ITEM_VARIATION,CATEGORY' });
-    if (cursor) params.set('cursor', cursor);
-    const data = await squareApiFetch(env, 'GET', '/v2/catalog/list?' + params.toString());
-    for (const obj of (data.objects || [])) {
-      if (obj.type === 'CATEGORY' && obj.category_data) {
-        categoryName[obj.id] = obj.category_data.name || '';
-      } else if (obj.type === 'ITEM' && obj.item_data) {
-        const cats = [];
-        if (obj.item_data.category_id) cats.push(obj.item_data.category_id);
-        if (Array.isArray(obj.item_data.categories)) {
-          obj.item_data.categories.forEach((c) => { if (c && c.id) cats.push(c.id); });
-        }
-        itemCategoryIds[obj.id] = cats;
-      } else if (obj.type === 'ITEM_VARIATION' && obj.item_variation_data && obj.item_variation_data.item_id) {
-        variationToItem[obj.id] = obj.item_variation_data.item_id;
-      }
-    }
-    cursor = data.cursor;
-  } while (cursor);
-  return { variationToItem, itemCategoryIds, categoryName };
-}
-
-function categoryBucketForVariation(variationId, maps) {
-  const itemId = variationId && maps.variationToItem[variationId];
-  if (!itemId) return 'other';
-  const catIds = maps.itemCategoryIds[itemId] || [];
-  for (const cid of catIds) {
-    const bucket = classifyCategoryName(maps.categoryName[cid]);
-    if (bucket !== 'other') return bucket;
-  }
-  return 'other';
-}
-
-async function apiSellers(env, url) {
+   silently dropped or wrongly bucketed. */async function apiSellers(env, url) {
   const cur = parseRange(url.searchParams.get('cur'));
   if (!cur) return json({ error: 'bad cur range' }, 400);
   const tz = url.searchParams.get('tz') || 'Australia/Sydney';
   const rollover = Math.max(0, Math.min(6, parseInt(url.searchParams.get('rollover') || '0', 10) || 0));
   if (!ADAPTERS.pos.configured || !env.POS_API_TOKEN) return json({ configured: false });
   try {
-    const [orders, maps] = await Promise.all([
-      squareFetchOrdersFull(env, cur.from, cur.to, tz, rollover),
-      squareCatalogMaps(env)
-    ]);
-    const qtyByBucket = { food: {}, beverage: {}, other: {} };
-    for (const o of orders) {
-      for (const li of o.line_items) {
-        const bucket = categoryBucketForVariation(li.catalogObjectId, maps);
-        qtyByBucket[bucket][li.name] = (qtyByBucket[bucket][li.name] || 0) + li.quantity;
-      }
-    }
-    const toSorted = (obj) => Object.keys(obj)
-      .map((name) => ({ name, qty: Math.round(obj[name] * 100) / 100 }))
+    const orders = await squareFetchOrdersFull(env, cur.from, cur.to, tz, rollover);
+    const qty = {};
+    for (const o of orders) for (const li of o.line_items) qty[li.name] = (qty[li.name] || 0) + li.quantity;
+    const items = Object.keys(qty)
+      .map((name) => ({ name, qty: Math.round(qty[name] * 100) / 100 }))
       .sort((a, b) => b.qty - a.qty);
-    return json({
-      configured: true,
-      food: toSorted(qtyByBucket.food),
-      beverage: toSorted(qtyByBucket.beverage),
-      other: toSorted(qtyByBucket.other)
-    });
+    return json({ configured: true, items });
   } catch (err) {
     return json({ configured: true, error: plainError(err.status || 500) }, 200);
   }
