@@ -300,7 +300,8 @@ var ACCENTS = [
   { key: 'blue',   c: '#1A5FB4', dim: 'rgba(26,95,180,0.12)' },
   { key: 'coral',  c: '#C04B28', dim: 'rgba(192,75,40,0.12)' },
   { key: 'purple', c: '#5C3DB0', dim: 'rgba(92,61,176,0.12)' },
-  { key: 'green',  c: '#1A7A3C', dim: 'rgba(26,122,60,0.12)' }
+  { key: 'green',  c: '#1A7A3C', dim: 'rgba(26,122,60,0.12)' },
+  { key: 'psred',  c: '#CC2D30', dim: 'rgba(204,45,48,0.12)' }
 ];
 
 function defaultSettings() {
@@ -334,9 +335,11 @@ function loadJson(key, fallback) {
 var RECON = loadJson('vd_recon', {});          /* metricKey -> 'confirmed' | 'flagged' */
 var ORG_OK = loadJson('vd_orgok', {});         /* sourceKey -> true */
 var MANUAL = loadJson('vd_manual', {});        /* rangeKey -> { from,to,period,values,attested,enteredAt } */
+var ACTIONS = loadJson('vd_actions', {});      /* weekStartIso -> [{text,done}] - extra, owner's own notes */
 function saveRecon() { try { localStorage.setItem('vd_recon', JSON.stringify(RECON)); } catch (e) {} }
 function saveOrgOk() { try { localStorage.setItem('vd_orgok', JSON.stringify(ORG_OK)); } catch (e) {} }
 function saveManual() { try { localStorage.setItem('vd_manual', JSON.stringify(MANUAL)); } catch (e) {} }
+function saveActions() { try { localStorage.setItem('vd_actions', JSON.stringify(ACTIONS)); } catch (e) {} }
 function isManual() { return SETTINGS.dataMode === 'manual'; }
 function rangeKey(from, to) { return iso(from) + '_' + iso(to); }
 
@@ -883,7 +886,24 @@ function renderDashboard(root) {
 
   var cur = periodValues('cur'), prev = periodValues('prev'), yoy = periodValues('yoy');
 
-  /* Extra: the "Overview" visuals (donut, ratios, combined trend chart) -
+  /* Extra: alert banner - a single "needs attention" line summarising any
+     target breach (targets already live in Settings), instead of having to
+     spot it card by card. */
+  var breaches = breachedTargets(cur);
+  if (breaches.length) {
+    var ab = el('div', 'banner banner-coral');
+    ab.innerHTML = '<b>' + breaches.length + (breaches.length === 1 ? ' number needs' : ' numbers need') + ' attention:</b> ' +
+      breaches.map(function (b) { return esc(b.label) + ' at ' + fmtPctVal(b.value); }).join(', ') + '.';
+    root.appendChild(ab);
+  }
+
+  /* Extra: this week's actions + last week's "did it work" - the owner's own
+     notes, always tied to the calendar week regardless of which period is
+     selected above. Client-side only (like Settings/targets), no server
+     round-trip needed. */
+  root.appendChild(actionsCard());
+
+  /* Extra: the "Overview" visuals (donut, ratios, combined trend charts) -
      same reconciled Xero figures as the cards below, just a different view.
      Placed at the top, above the cards, at the owner's request. */
   if (isConfigured('accounting') && cur.revenue != null) {
@@ -894,6 +914,8 @@ function renderDashboard(root) {
     root.appendChild(ovGrid);
     var combo = comboCard();
     if (combo) root.appendChild(combo);
+    var wageCombo = revenueVsWageTrendCard();
+    if (wageCombo) root.appendChild(wageCombo);
   }
 
   /* Cards */
@@ -1073,6 +1095,181 @@ function coversExtraCard(cur, r) {
   wrap.appendChild(form);
   wrap.appendChild(msg);
   return wrap;
+}
+
+/* ---------- Extras: alert banner, weekly actions, revenue-vs-wage% trend ---
+   Added after reviewing another owner's mockup. None of these touch the
+   locked six/seven metrics or their sourcing rules - alerts and the wage%
+   trend reuse figures already computed above; actions are the owner's own
+   typed notes, stored client-side exactly like Settings/targets already are. */
+
+function breachedTargets(cur) {
+  var keys = ['cogs', 'wage', 'overheads', 'profit'];
+  var out = [];
+  keys.forEach(function (k) {
+    if (CHOSEN.indexOf(k) < 0) return;
+    if (!METRIC_DEFS[k].needs.every(isConfigured)) return;
+    var pf = primaryFigure(k, cur);
+    if (pf == null) return;
+    if (targetBreached(k, pf)) out.push({ key: k, label: METRIC_DEFS[k].label, value: pf });
+  });
+  return out;
+}
+
+function actionsCard() {
+  var weekStart = startOfWeek(tradingToday());
+  var prevWeekStart = addDays(weekStart, -7);
+  var wk = iso(weekStart), prevWk = iso(prevWeekStart);
+  if (!ACTIONS[wk]) ACTIONS[wk] = [];
+  var items = ACTIONS[wk];
+  var prevItems = ACTIONS[prevWk] || [];
+
+  var card = el('div', 'mcard fade-in');
+  card.style.marginTop = '1rem';
+  card.appendChild(el('div', 'm-label', 'This week\u2019s actions · extra, your own notes'));
+  card.appendChild(el('div', 'm-def', 'A couple of things you\u2019re doing about the numbers this week - kept short on purpose.'));
+
+  var list = el('div', '');
+  list.style.marginTop = '0.6rem';
+  items.forEach(function (item, idx) {
+    var row = el('div', '');
+    row.style.cssText = 'display:flex;align-items:center;gap:8px;padding:4px 0;';
+    var cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = !!item.done;
+    cb.onclick = function () { item.done = cb.checked; saveActions(); render(); };
+    row.appendChild(cb);
+    var span = el('span', '', item.text);
+    span.style.cssText = (item.done ? 'text-decoration:line-through;color:var(--muted);' : '') + 'flex:1;font-size:13px;';
+    row.appendChild(span);
+    var del = el('button', 'btn-plain', 'Remove');
+    del.style.cssText = 'padding:3px 9px;font-size:11px;';
+    del.onclick = function () { items.splice(idx, 1); saveActions(); render(); };
+    row.appendChild(del);
+    list.appendChild(row);
+  });
+  if (!items.length) list.appendChild(el('div', 'conn-line', 'Nothing added yet for this week.'));
+  card.appendChild(list);
+
+  if (items.length < 2) {
+    var addRow = el('div', 'conn-actions');
+    addRow.style.marginTop = '0.6rem';
+    var input = document.createElement('input');
+    input.type = 'text';
+    input.placeholder = 'e.g. Adjust Sunday roster start times';
+    input.style.cssText = 'flex:1;font-family:DM Sans,sans-serif;font-size:13px;padding:7px 10px;border:1px solid var(--border-med);border-radius:8px;min-width:220px;';
+    var addBtn = el('button', 'btn-small', 'Add');
+    addBtn.onclick = function () {
+      var v = (input.value || '').trim();
+      if (!v) return;
+      items.push({ text: v, done: false });
+      saveActions();
+      render();
+    };
+    addRow.appendChild(input);
+    addRow.appendChild(addBtn);
+    card.appendChild(addRow);
+  } else {
+    var capNote = el('div', 'conn-line', 'Two\u2019s the limit here - keeps this to what actually matters this week.');
+    capNote.style.marginTop = '0.5rem';
+    card.appendChild(capNote);
+  }
+
+  if (prevItems.length) {
+    var prevHead = el('div', 'm-label', 'Did it work — last week\u2019s actions');
+    prevHead.style.marginTop = '1rem';
+    card.appendChild(prevHead);
+    var prevList = el('div', '');
+    prevList.style.marginTop = '0.4rem';
+    prevItems.forEach(function (item) {
+      var row = el('div', 'conn-line');
+      row.innerHTML = (item.done
+        ? '<span style="color:var(--c-green)">✓</span> '
+        : '<span style="color:var(--c-coral)">✗ not done</span> ') + esc(item.text);
+      prevList.appendChild(row);
+    });
+    card.appendChild(prevList);
+  }
+
+  return card;
+}
+
+function revenueVsWageTrendCard() {
+  var t = state.data && state.data.trend;
+  if (!t || !t.accounting) return null;
+  var months = t.months || [];
+  var rev = (t.accounting.revenue || []).slice();
+  var ws = (t.accounting.wagesSuper || []).slice();
+  var n = months.length, start = Math.max(0, n - 12);
+  months = months.slice(start); rev = rev.slice(start); ws = ws.slice(start);
+  var wagePct = rev.map(function (v, i) {
+    return (v != null && ws[i] != null && v !== 0) ? (ws[i] / v * 100) : null;
+  });
+  var shownRev = rev.filter(function (x) { return x != null; });
+  var shownPct = wagePct.filter(function (x) { return x != null; });
+  if (!shownRev.length || !shownPct.length) return null;
+
+  var maxRev = Math.max.apply(null, shownRev.concat([0]));
+  var maxPct = Math.max.apply(null, shownPct.concat([1]));
+  var W = 700, H = 160, gap = 6, NS = 'http://www.w3.org/2000/svg';
+  var bw = (W - gap * (rev.length - 1)) / rev.length;
+
+  var svg = document.createElementNS(NS, 'svg');
+  svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
+  svg.setAttribute('preserveAspectRatio', 'none');
+  svg.style.cssText = 'display:block;width:100%;height:180px';
+
+  for (var i = 0; i < rev.length; i++) {
+    if (rev[i] == null) continue;
+    var x = i * (bw + gap);
+    var h = maxRev > 0 ? (rev[i] / maxRev) * H : 0;
+    var top = H - h;
+    var rect = document.createElementNS(NS, 'rect');
+    rect.setAttribute('x', x.toFixed(1));
+    rect.setAttribute('y', top.toFixed(1));
+    rect.setAttribute('width', bw.toFixed(1));
+    rect.setAttribute('height', Math.max(1.5, h).toFixed(1));
+    rect.setAttribute('rx', '2');
+    rect.setAttribute('fill', 'var(--accent)');
+    rect.setAttribute('opacity', '0.85');
+    rect.setAttribute('data-lab', months[i] + ' · Revenue ' + fmtMoney(rev[i], false) + (wagePct[i] != null ? ' · Wage % ' + wagePct[i].toFixed(1) + '%' : ''));
+    svg.appendChild(rect);
+  }
+
+  var pts = [];
+  for (var j = 0; j < wagePct.length; j++) {
+    if (wagePct[j] == null) continue;
+    var px = j * (bw + gap) + bw / 2;
+    var py = H - (wagePct[j] / maxPct) * H;
+    pts.push({ x: px, y: py });
+  }
+  if (pts.length > 1) {
+    var poly = document.createElementNS(NS, 'polyline');
+    poly.setAttribute('points', pts.map(function (p) { return p.x.toFixed(1) + ',' + p.y.toFixed(1); }).join(' '));
+    poly.setAttribute('fill', 'none');
+    poly.setAttribute('stroke', 'var(--c-coral)');
+    poly.setAttribute('stroke-width', '2.5');
+    svg.appendChild(poly);
+  }
+  pts.forEach(function (p) {
+    var dot = document.createElementNS(NS, 'circle');
+    dot.setAttribute('cx', p.x.toFixed(1));
+    dot.setAttribute('cy', p.y.toFixed(1));
+    dot.setAttribute('r', '2.5');
+    dot.setAttribute('fill', 'var(--c-coral)');
+    svg.appendChild(dot);
+  });
+
+  var holder = el('div', 'tbars-svg');
+  holder.appendChild(svg);
+  attachBarTip(holder);
+
+  var card = el('div', 'mcard fade-in');
+  card.style.marginTop = '1rem';
+  card.appendChild(el('div', 'm-label', 'Revenue and Wage % trend'));
+  card.appendChild(el('div', 'm-def', 'Monthly revenue bars with Wage % line over the top (its own scale), last 12 months.'));
+  card.appendChild(holder);
+  return card;
 }
 
 function donutCard(cur, profit) {
