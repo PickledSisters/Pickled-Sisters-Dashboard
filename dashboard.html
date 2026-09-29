@@ -997,7 +997,7 @@ function sellerList(title, rows) {
 function sellersExtraCard(r) {
   var wrap = el('div', 'mcard fade-in');
   wrap.style.marginTop = '1rem';
-  wrap.appendChild(el('div', 'm-label', 'Top and bottom sellers · extra, units sold from Square'));
+  wrap.appendChild(el('div', 'm-label', 'Top and bottom sellers · extra, food items only, units sold from Square'));
   var body = el('div', 'm-def', 'Loading…');
   wrap.appendChild(body);
   fetch(extrasApiUrl('/api/extras/sellers', r)).then(function (res) { return res.json(); }).then(function (j) {
@@ -1019,6 +1019,55 @@ function coversValue(slot) {
   return (typeof v === 'number' && isFinite(v)) ? v : null;
 }
 
+var DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+function coversWeekTable() {
+  var wkStart = startOfWeek(tradingToday());
+  var days = [];
+  for (var i = 0; i < 7; i++) days.push(addDays(wkStart, i));
+  var box = el('div', 'm-def');
+  box.style.marginTop = '0.6rem';
+  var title = el('div', 'm-def', 'This week, day by day');
+  title.style.cssText = 'font-weight:600;margin-bottom:0.3rem;';
+  var table = document.createElement('table');
+  table.style.cssText = 'width:100%;border-collapse:collapse;font-size:13px;';
+  table.innerHTML = '<tbody></tbody>';
+  var tbody = table.querySelector('tbody');
+  days.forEach(function (d) {
+    var row = document.createElement('tr');
+    row.style.cssText = 'border-bottom:1px solid var(--border-med);';
+    var tdDay = document.createElement('td');
+    tdDay.style.cssText = 'padding:5px 8px 5px 0;color:var(--text-dim);';
+    tdDay.textContent = DAY_NAMES[d.getUTCDay()] + ' ' + iso(d);
+    var tdVal = document.createElement('td');
+    tdVal.style.cssText = 'padding:5px 0;text-align:right;font-weight:600;';
+    tdVal.textContent = '…';
+    row.appendChild(tdDay);
+    row.appendChild(tdVal);
+    tbody.appendChild(row);
+  });
+  var wrap = el('div');
+  wrap.appendChild(title);
+  wrap.appendChild(table);
+  fetch('/api/extras/covers-daily?from=' + iso(wkStart) + '&to=' + iso(addDays(wkStart, 6)))
+    .then(function (res) { return res.json(); })
+    .then(function (j) {
+      var byDate = {};
+      (j.days || []).forEach(function (row) { byDate[row.date] = row.covers; });
+      var rows = tbody.querySelectorAll('tr');
+      days.forEach(function (d, i) {
+        var v = byDate[iso(d)];
+        var td = rows[i].children[1];
+        if (v == null) { td.textContent = 'not entered yet'; td.style.fontWeight = '400'; td.style.color = 'var(--text-dim)'; }
+        else { td.textContent = v + ' covers'; }
+      });
+    })
+    .catch(function () {
+      tbody.querySelectorAll('tr').forEach(function (row) { row.children[1].textContent = '—'; });
+    });
+  return wrap;
+}
+
 function coversExtraCard(cur, r) {
   var wrap = el('div', 'mcard fade-in');
   wrap.style.marginTop = '1rem';
@@ -1038,6 +1087,8 @@ function coversExtraCard(cur, r) {
     wrap.appendChild(el('div', 'm-value', fmtMoney(revenue / covers, false)));
     wrap.appendChild(el('div', 'm-def', 'Revenue ÷ covers · ' + covers + ' covers entered for ' + fmtRange(r)));
   }
+
+  wrap.appendChild(coversWeekTable());
 
   var form = el('div', 'conn-actions');
   form.style.marginTop = '0.8rem';

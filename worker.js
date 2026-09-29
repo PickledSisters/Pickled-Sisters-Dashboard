@@ -790,6 +790,24 @@ async function readIngested(env, source, from, to) {
   return { sums, daysWithData, lastDate };
 }
 
+/* Per-day breakdown (not summed) - used by the covers-daily extra so the
+   owner can see exactly which days they have and haven't entered yet. */
+async function readIngestedDaily(env, source, from, to) {
+  const out = [];
+  for (const date of eachDate(from, to)) {
+    const raw = await env.TOKENS.get('data:' + source + ':' + date);
+    let value = null;
+    if (raw) {
+      try {
+        const row = JSON.parse(raw);
+        if (typeof row.covers === 'number' && isFinite(row.covers)) value = row.covers;
+      } catch (e) { /* skip bad row */ }
+    }
+    out.push({ date, covers: value });
+  }
+  return out;
+}
+
 async function monthlyIngested(env, source, fromMonth, toMonth) {
   const months = monthList(fromMonth, toMonth);
   const out = { months, byMonth: [] };
@@ -915,6 +933,19 @@ async function apiCovers(env, request) {
   return json({ ok: true });
 }
 
+/* GET /api/extras/covers-daily?from=YYYY-MM-DD&to=YYYY-MM-DD - session-cookie
+   auth, day-by-day covers so the owner can see exactly what they've entered
+   for each day (not just the period total from apiMetrics). */
+async function apiCoversDaily(env, url) {
+  const from = url.searchParams.get('from');
+  const to = url.searchParams.get('to');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(from || '') || !/^\d{4}-\d{2}-\d{2}$/.test(to || '')) {
+    return json({ error: 'bad range' }, 400);
+  }
+  const days = await readIngestedDaily(env, 'covers', from, to);
+  return json({ days });
+}
+
 /* ---------------- Square extras: daypart split + top/bottom sellers ------
    Both extras, added at the owner's request - NOT part of kpi-spec.md's
    locked six/seven. Quantity and transaction-count only, never a dollar
@@ -998,18 +1029,81 @@ async function apiDayparts(env, url) {
 }
 
 /* Food vs Beverage grouping - confirmed directly with the owner (their actual
-   Square category names, not guessed). Anything outside these lists goes to
-   "other" so a miscategorised or new Square category is surfaced, never
-   silently dropped or wrongly bucketed. */async function apiSellers(env, url) {
+   Square category names, not guessed). Anything outside these lists is
+   neither food nor beverage (e.g. merchandise, gift cards) and is excluded
+   from the food-only sellers list below rather than guessed into it. */
+const FOOD_CATEGORY_NAMES = ['lunch', 'brunch', 'desserts', 'pasta night', 'mains', 'starters', 'sides', 'to start and share', 'friday night menu', "children's menu", 'food'];
+const BEVERAGE_CATEGORY_NAMES = ['wine', 'wine by the glass', 'red wine', 'white wine', 'cocktails', 'spirits', 'spiritis', 'fortifieds', 'sparkling', 'non alcoholic', 'coffee/tea', 'beer'];
+
+function classifyCategoryName(name) {
+  const n = (name || '').toLowerCase().trim();
+  if (FOOD_CATEGORY_NAMES.includes(n)) return 'food';
+  if (BEVERAGE_CATEGORY_NAMES.includes(n)) return 'beverage';
+  return 'other';
+}
+
+/* Builds variation -> item -> category maps from Square's Catalog, so a line
+   item's catalog_object_id (an ITEM_VARIATION id) can be traced to its
+   category name. Paginated; a small venue's catalog is a handful of calls. */
+async function squareCatalogMaps(env) {
+  let cursor;
+  const variationToItem = {};
+  const itemCategoryIds = {};
+  const categoryName = {};
+  do {
+    const params = new URLSearchParams({ types: 'ITEM,ITEM_VARIATION,CATEGORY' });
+    if (cursor) params.set('cursor', cursor);
+    const data = await squareApiFetch(env, 'GET', '/v2/catalog/list?' + params.toString());
+    for (const obj of (data.objects || [])) {
+      if (obj.type === 'CATEGORY' && obj.category_data) {
+        categoryName[obj.id] = obj.category_data.name || '';
+      } else if (obj.type === 'ITEM' && obj.item_data) {
+        const cats = [];
+        if (obj.item_data.category_id) cats.push(obj.item_data.category_id);
+        if (Array.isArray(obj.item_data.categories)) {
+          obj.item_data.categories.forEach((c) => { if (c && c.id) cats.push(c.id); });
+        }
+        itemCategoryIds[obj.id] = cats;
+      } else if (obj.type === 'ITEM_VARIATION' && obj.item_variation_data && obj.item_variation_data.item_id) {
+        variationToItem[obj.id] = obj.item_variation_data.item_id;
+      }
+    }
+    cursor = data.cursor;
+  } while (cursor);
+  return { variationToItem, itemCategoryIds, categoryName };
+}
+
+function categoryBucketForVariation(variationId, maps) {
+  const itemId = variationId && maps.variationToItem[variationId];
+  if (!itemId) return 'other';
+  const catIds = maps.itemCategoryIds[itemId] || [];
+  for (const cid of catIds) {
+    const bucket = classifyCategoryName(maps.categoryName[cid]);
+    if (bucket !== 'other') return bucket;
+  }
+  return 'other';
+}
+
+/* Top/bottom sellers - food items only, at the owner's request. Units sold
+   (quantity), never a dollar figure pulled from Square (CLAUDE.md rule 2). */
+async function apiSellers(env, url) {
   const cur = parseRange(url.searchParams.get('cur'));
   if (!cur) return json({ error: 'bad cur range' }, 400);
   const tz = url.searchParams.get('tz') || 'Australia/Sydney';
   const rollover = Math.max(0, Math.min(6, parseInt(url.searchParams.get('rollover') || '0', 10) || 0));
   if (!ADAPTERS.pos.configured || !env.POS_API_TOKEN) return json({ configured: false });
   try {
-    const orders = await squareFetchOrdersFull(env, cur.from, cur.to, tz, rollover);
+    const [orders, maps] = await Promise.all([
+      squareFetchOrdersFull(env, cur.from, cur.to, tz, rollover),
+      squareCatalogMaps(env)
+    ]);
     const qty = {};
-    for (const o of orders) for (const li of o.line_items) qty[li.name] = (qty[li.name] || 0) + li.quantity;
+    for (const o of orders) {
+      for (const li of o.line_items) {
+        if (categoryBucketForVariation(li.catalogObjectId, maps) !== 'food') continue;
+        qty[li.name] = (qty[li.name] || 0) + li.quantity;
+      }
+    }
     const items = Object.keys(qty)
       .map((name) => ({ name, qty: Math.round(qty[name] * 100) / 100 }))
       .sort((a, b) => b.qty - a.qty);
@@ -1151,6 +1245,10 @@ export default {
     if (path === '/api/covers' && request.method === 'POST') {
       if (!loggedIn) return json({ error: 'auth' }, 401);
       return apiCovers(env, request);
+    }
+    if (path === '/api/extras/covers-daily' && request.method === 'GET') {
+      if (!loggedIn) return json({ error: 'auth' }, 401);
+      return apiCoversDaily(env, url);
     }
     if (path === '/api/extras/dayparts' && request.method === 'GET') {
       if (!loggedIn) return json({ error: 'auth' }, 401);
