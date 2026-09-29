@@ -1020,24 +1020,22 @@ function dailyTakingsCard(r) {
     scrollBox.style.cssText = 'max-height:340px;overflow-y:auto;border:1px solid var(--border-med);border-radius:8px;';
     var table = document.createElement('table');
     table.style.cssText = 'width:100%;border-collapse:collapse;font-size:13px;';
-    var cols = ['Day', 'Net sales', 'Budget', 'Variance', 'Trans', 'Avg spend', 'Wage%'];
+    var cols = ['Day', 'Net sales', 'Budget', 'Variance', 'Trans', 'Avg spend'];
     table.innerHTML = '<thead><tr>' + cols.map(function (c, i) {
       return '<th style="text-align:' + (i === 0 ? 'left' : 'right') + ';padding:6px 8px;color:var(--text-dim);font-weight:600;position:sticky;top:0;background:var(--bg-card);">' + c + '</th>';
     }).join('') + '</tr></thead><tbody></tbody>';
     var tbody = table.querySelector('tbody');
-    var totRev = 0, totBudget = 0, totTx = 0, totWagesSuper = 0, anyWage = false;
+    var totRev = 0, totBudget = 0, totTx = 0;
     days.forEach(function (d) {
       var wd = fromIso(d.date).getUTCDay();
       var budget = (SETTINGS.dailyBudget && typeof SETTINGS.dailyBudget[wd] === 'number') ? SETTINGS.dailyBudget[wd] : 0;
       var rev = d.revenue;
       var tx = d.transactions;
-      var wagePct = (rev != null && rev !== 0 && d.wagesSuper != null) ? (d.wagesSuper / rev * 100) : null;
       var avgSpend = (rev != null && tx != null && tx > 0) ? (rev / tx) : null;
       var variance = (rev != null) ? (rev - budget) : null;
       var variancePct = (variance != null && budget > 0) ? (variance / budget * 100) : null;
       if (rev != null) { totRev += rev; totBudget += budget; }
       if (tx != null) totTx += tx;
-      if (rev != null && d.wagesSuper != null) { totWagesSuper += d.wagesSuper; anyWage = true; }
 
       var tr = document.createElement('tr');
       tr.style.cssText = 'border-top:1px solid var(--border-med);';
@@ -1057,13 +1055,7 @@ function dailyTakingsCard(r) {
       tdTx.textContent = (tx == null) ? '—' : tx;
       var tdAvg = document.createElement('td'); tdAvg.style.cssText = 'padding:5px 8px;text-align:right;';
       tdAvg.textContent = (avgSpend == null) ? '—' : fmtMoney(avgSpend, false);
-      var tdWage = document.createElement('td'); tdWage.style.cssText = 'padding:5px 8px;text-align:right;';
-      if (wagePct == null) { tdWage.textContent = '—'; }
-      else {
-        tdWage.textContent = Math.round(wagePct * 10) / 10 + '%';
-        if (targetBreached('wage', wagePct)) tdWage.style.color = 'var(--c-coral)';
-      }
-      [tdDay, tdSales, tdBudget, tdVar, tdTx, tdAvg, tdWage].forEach(function (td) { tr.appendChild(td); });
+      [tdDay, tdSales, tdBudget, tdVar, tdTx, tdAvg].forEach(function (td) { tr.appendChild(td); });
       tbody.appendChild(tr);
     });
 
@@ -1072,15 +1064,13 @@ function dailyTakingsCard(r) {
     var totVariance = totRev - totBudget;
     var totVariancePct = totBudget > 0 ? (totVariance / totBudget * 100) : null;
     var totAvgSpend = totTx > 0 ? (totRev / totTx) : null;
-    var totWagePct = (anyWage && totRev > 0) ? (totWagesSuper / totRev * 100) : null;
     var cellsHtml = [
       'To date',
       fmtMoney(totRev, false),
       fmtMoney(totBudget, false),
       (totVariance >= 0 ? '+' : '') + fmtMoney(totVariance, false) + (totVariancePct != null ? ' (' + (totVariancePct >= 0 ? '+' : '') + Math.round(totVariancePct) + '%)' : ''),
       totTx,
-      totAvgSpend != null ? fmtMoney(totAvgSpend, false) : '—',
-      totWagePct != null ? (Math.round(totWagePct * 10) / 10 + '%') : '—'
+      totAvgSpend != null ? fmtMoney(totAvgSpend, false) : '—'
     ];
     cellsHtml.forEach(function (v, i) {
       var td = document.createElement('td');
