@@ -793,8 +793,8 @@ async function readIngested(env, source, from, to) {
 /* Per-day breakdown (not summed) - used by the covers-daily extra so the
    owner can see exactly which days they have and haven't entered yet. */
 async function readIngestedDaily(env, source, from, to) {
-  const out = [];
-  for (const date of eachDate(from, to)) {
+  const dates = eachDate(from, to);
+  return Promise.all(dates.map(async (date) => {
     const raw = await env.TOKENS.get('data:' + source + ':' + date);
     let value = null;
     if (raw) {
@@ -803,9 +803,8 @@ async function readIngestedDaily(env, source, from, to) {
         if (typeof row.covers === 'number' && isFinite(row.covers)) value = row.covers;
       } catch (e) { /* skip bad row */ }
     }
-    out.push({ date, covers: value });
-  }
-  return out;
+    return { date, covers: value };
+  }));
 }
 
 async function monthlyIngested(env, source, fromMonth, toMonth) {

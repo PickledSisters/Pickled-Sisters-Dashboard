@@ -1021,49 +1021,76 @@ function coversValue(slot) {
 
 var DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
-function coversWeekTable() {
-  var wkStart = startOfWeek(tradingToday());
+/* Day-by-day covers for whichever period is selected at the top of the
+   dashboard (this week, last month, this financial year, custom range,
+   etc) - r is the same resolved period used everywhere else, so this
+   always matches what's on screen. Shows what's been entered per day and
+   a running tally alongside it. Long periods (a financial year) scroll
+   inside a fixed-height box rather than stretching the card. */
+function coversPeriodTable(r) {
   var days = [];
-  for (var i = 0; i < 7; i++) days.push(addDays(wkStart, i));
-  var box = el('div', 'm-def');
-  box.style.marginTop = '0.6rem';
-  var title = el('div', 'm-def', 'This week, day by day');
+  var cursor = r.from;
+  while (cursor.getTime() <= r.to.getTime() && days.length < 400) {
+    days.push(cursor);
+    cursor = addDays(cursor, 1);
+  }
+  var title = el('div', 'm-def', 'Day by day · ' + fmtRange(r));
   title.style.cssText = 'font-weight:600;margin-bottom:0.3rem;';
+  var scrollBox = document.createElement('div');
+  scrollBox.style.cssText = 'max-height:280px;overflow-y:auto;border:1px solid var(--border-med);border-radius:8px;';
   var table = document.createElement('table');
   table.style.cssText = 'width:100%;border-collapse:collapse;font-size:13px;';
-  table.innerHTML = '<tbody></tbody>';
+  table.innerHTML = '<thead><tr>'
+    + '<th style="text-align:left;padding:6px 8px;color:var(--text-dim);font-weight:600;position:sticky;top:0;background:var(--bg-card);">Day</th>'
+    + '<th style="text-align:right;padding:6px 8px;color:var(--text-dim);font-weight:600;position:sticky;top:0;background:var(--bg-card);">Entered</th>'
+    + '<th style="text-align:right;padding:6px 8px;color:var(--text-dim);font-weight:600;position:sticky;top:0;background:var(--bg-card);">Running tally</th>'
+    + '</tr></thead><tbody></tbody>';
   var tbody = table.querySelector('tbody');
   days.forEach(function (d) {
     var row = document.createElement('tr');
-    row.style.cssText = 'border-bottom:1px solid var(--border-med);';
+    row.style.cssText = 'border-top:1px solid var(--border-med);';
     var tdDay = document.createElement('td');
-    tdDay.style.cssText = 'padding:5px 8px 5px 0;color:var(--text-dim);';
+    tdDay.style.cssText = 'padding:5px 8px;color:var(--text-dim);white-space:nowrap;';
     tdDay.textContent = DAY_NAMES[d.getUTCDay()] + ' ' + iso(d);
     var tdVal = document.createElement('td');
-    tdVal.style.cssText = 'padding:5px 0;text-align:right;font-weight:600;';
+    tdVal.style.cssText = 'padding:5px 8px;text-align:right;font-weight:600;';
     tdVal.textContent = '…';
+    var tdTally = document.createElement('td');
+    tdTally.style.cssText = 'padding:5px 8px;text-align:right;color:var(--text-dim);';
+    tdTally.textContent = '…';
     row.appendChild(tdDay);
     row.appendChild(tdVal);
+    row.appendChild(tdTally);
     tbody.appendChild(row);
   });
+  scrollBox.appendChild(table);
   var wrap = el('div');
   wrap.appendChild(title);
-  wrap.appendChild(table);
-  fetch('/api/extras/covers-daily?from=' + iso(wkStart) + '&to=' + iso(addDays(wkStart, 6)))
+  wrap.appendChild(scrollBox);
+  fetch('/api/extras/covers-daily?from=' + iso(r.from) + '&to=' + iso(r.to))
     .then(function (res) { return res.json(); })
     .then(function (j) {
       var byDate = {};
       (j.days || []).forEach(function (row) { byDate[row.date] = row.covers; });
       var rows = tbody.querySelectorAll('tr');
+      var tally = 0;
       days.forEach(function (d, i) {
         var v = byDate[iso(d)];
-        var td = rows[i].children[1];
-        if (v == null) { td.textContent = 'not entered yet'; td.style.fontWeight = '400'; td.style.color = 'var(--text-dim)'; }
-        else { td.textContent = v + ' covers'; }
+        var tdVal = rows[i].children[1];
+        var tdTally = rows[i].children[2];
+        if (v == null) {
+          tdVal.textContent = 'not entered yet'; tdVal.style.fontWeight = '400'; tdVal.style.color = 'var(--text-dim)';
+        } else {
+          tdVal.textContent = v + ' covers';
+          tally += v;
+        }
+        tdTally.textContent = tally + ' covers';
       });
     })
     .catch(function () {
-      tbody.querySelectorAll('tr').forEach(function (row) { row.children[1].textContent = '—'; });
+      tbody.querySelectorAll('tr').forEach(function (row) {
+        row.children[1].textContent = '—'; row.children[2].textContent = '—';
+      });
     });
   return wrap;
 }
@@ -1088,10 +1115,13 @@ function coversExtraCard(cur, r) {
     wrap.appendChild(el('div', 'm-def', 'Revenue ÷ covers · ' + covers + ' covers entered for ' + fmtRange(r)));
   }
 
-  wrap.appendChild(coversWeekTable());
+  wrap.appendChild(coversPeriodTable(r));
 
   var form = el('div', 'conn-actions');
   form.style.marginTop = '0.8rem';
+  var hint = el('div', 'm-def', 'Pick any date, including previous weeks, to add or correct a day.');
+  hint.style.cssText = 'color:var(--text-dim);margin-bottom:0.3rem;';
+  wrap.appendChild(hint);
   var dateIn = document.createElement('input');
   dateIn.type = 'date';
   dateIn.value = new Date().toISOString().slice(0, 10);
