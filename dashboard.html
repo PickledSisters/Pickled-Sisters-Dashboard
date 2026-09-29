@@ -313,7 +313,8 @@ function defaultSettings() {
     timezone: TZ_DEFAULTS[KIT_CONFIG.region] || 'Australia/Sydney',
     accent: 'gold',
     dataMode: KIT_CONFIG.startLevel === 'manual' ? 'manual' : 'live',
-    targets: { cogs: 30, wage: 30, overheads: 30, profit: 10 }
+    targets: { cogs: 30, wage: 30, overheads: 30, profit: 10 },
+    dailyBudget: [0, 0, 0, 0, 0, 0, 0] /* Sun..Sat, ex-GST revenue target per day of week */
   };
 }
 function loadSettings() {
@@ -939,12 +940,165 @@ function renderDashboard(root) {
      CLAUDE.md rule 2). Not part of kpi-spec.md's locked six/seven. */
   root.appendChild(daypartExtraCard(r));
   root.appendChild(sellersExtraCard(r));
+
+  /* Extras: trading pattern by day of week, and daily takings vs budget +
+     wage% - both from the same per-day Xero/Square pull. Not part of
+     kpi-spec.md's locked six/seven; budget is the owner's own setting. */
+  root.appendChild(dayOfWeekCard(r));
+  root.appendChild(dailyTakingsCard(r));
 }
 
 function extrasApiUrl(path, r) {
   return path + '?cur=' + iso(r.from) + ':' + iso(r.to)
     + '&tz=' + encodeURIComponent(SETTINGS.timezone)
     + '&rollover=' + (+SETTINGS.rolloverHour || 0);
+}
+
+/* Day-of-week pattern + daily takings-vs-budget - both extras, sharing the
+   /api/extras/daily payload (per-day Revenue/wages from Xero, transactions
+   from Square). Not part of kpi-spec.md's locked six/seven; budget and
+   wage-target comparisons use SETTINGS, exactly like the core cards do. */
+function fetchDailyExtras(r) {
+  return fetch(extrasApiUrl('/api/extras/daily', r)).then(function (res) { return res.json(); });
+}
+
+function dayOfWeekCard(r) {
+  var wrap = el('div', 'mcard fade-in');
+  wrap.style.marginTop = '1rem';
+  wrap.appendChild(el('div', 'm-label', 'Trading pattern by day of week · extra, averages for ' + fmtRange(r)));
+  var body = el('div', 'm-def', 'Loading…');
+  wrap.appendChild(body);
+  fetchDailyExtras(r).then(function (j) {
+    body.innerHTML = '';
+    if (!j.accounting && !j.pos) { body.textContent = 'Not configured — connect Xero or Square first.'; return; }
+    var buckets = [0, 1, 2, 3, 4, 5, 6].map(function () { return { revSum: 0, revN: 0, txSum: 0, txN: 0 }; });
+    (j.days || []).forEach(function (d) {
+      var wd = fromIso(d.date).getUTCDay();
+      if (d.revenue != null) { buckets[wd].revSum += d.revenue; buckets[wd].revN++; }
+      if (d.transactions != null) { buckets[wd].txSum += d.transactions; buckets[wd].txN++; }
+    });
+    var table = document.createElement('table');
+    table.style.cssText = 'width:100%;border-collapse:collapse;font-size:13px;';
+    table.innerHTML = '<thead><tr>'
+      + '<th style="text-align:left;padding:6px 8px;color:var(--text-dim);font-weight:600;">Day</th>'
+      + '<th style="text-align:right;padding:6px 8px;color:var(--text-dim);font-weight:600;">Avg revenue</th>'
+      + '<th style="text-align:right;padding:6px 8px;color:var(--text-dim);font-weight:600;">Avg transactions</th>'
+      + '<th style="text-align:right;padding:6px 8px;color:var(--text-dim);font-weight:600;">Weeks sampled</th>'
+      + '</tr></thead><tbody></tbody>';
+    var tbody = table.querySelector('tbody');
+    for (var wd = 0; wd < 7; wd++) {
+      var b = buckets[wd];
+      var tr = document.createElement('tr');
+      tr.style.cssText = 'border-top:1px solid var(--border-med);';
+      var tdDay = document.createElement('td'); tdDay.style.cssText = 'padding:5px 8px;'; tdDay.textContent = DAY_NAMES_FULL[wd];
+      var tdRev = document.createElement('td'); tdRev.style.cssText = 'padding:5px 8px;text-align:right;font-weight:600;';
+      tdRev.textContent = (j.accounting && b.revN) ? fmtMoney(b.revSum / b.revN, false) : '—';
+      var tdTx = document.createElement('td'); tdTx.style.cssText = 'padding:5px 8px;text-align:right;';
+      tdTx.textContent = (j.pos && b.txN) ? (Math.round(b.txSum / b.txN * 10) / 10) : '—';
+      var tdN = document.createElement('td'); tdN.style.cssText = 'padding:5px 8px;text-align:right;color:var(--text-dim);';
+      tdN.textContent = Math.max(b.revN, b.txN);
+      tr.appendChild(tdDay); tr.appendChild(tdRev); tr.appendChild(tdTx); tr.appendChild(tdN);
+      tbody.appendChild(tr);
+    }
+    body.appendChild(table);
+  }).catch(function () { body.textContent = 'Could not load this just now.'; });
+  return wrap;
+}
+
+function dailyTakingsCard(r) {
+  var wrap = el('div', 'mcard fade-in');
+  wrap.style.marginTop = '1rem';
+  wrap.appendChild(el('div', 'm-label', 'Daily takings vs budget · extra, ' + fmtRange(r)));
+  var body = el('div', 'm-def', 'Loading…');
+  wrap.appendChild(body);
+  fetchDailyExtras(r).then(function (j) {
+    body.innerHTML = '';
+    if (!j.accounting) { body.textContent = 'Not configured — connect Xero first (this needs daily Revenue).'; return; }
+    var days = j.days || [];
+    if (!days.length) { body.textContent = 'No days in this range.'; return; }
+    var scrollBox = document.createElement('div');
+    scrollBox.style.cssText = 'max-height:340px;overflow-y:auto;border:1px solid var(--border-med);border-radius:8px;';
+    var table = document.createElement('table');
+    table.style.cssText = 'width:100%;border-collapse:collapse;font-size:13px;';
+    var cols = ['Day', 'Net sales', 'Budget', 'Variance', 'Trans', 'Avg spend', 'Wage%'];
+    table.innerHTML = '<thead><tr>' + cols.map(function (c, i) {
+      return '<th style="text-align:' + (i === 0 ? 'left' : 'right') + ';padding:6px 8px;color:var(--text-dim);font-weight:600;position:sticky;top:0;background:var(--bg-card);">' + c + '</th>';
+    }).join('') + '</tr></thead><tbody></tbody>';
+    var tbody = table.querySelector('tbody');
+    var totRev = 0, totBudget = 0, totTx = 0, totWagesSuper = 0, anyWage = false;
+    days.forEach(function (d) {
+      var wd = fromIso(d.date).getUTCDay();
+      var budget = (SETTINGS.dailyBudget && typeof SETTINGS.dailyBudget[wd] === 'number') ? SETTINGS.dailyBudget[wd] : 0;
+      var rev = d.revenue;
+      var tx = d.transactions;
+      var wagePct = (rev != null && rev !== 0 && d.wagesSuper != null) ? (d.wagesSuper / rev * 100) : null;
+      var avgSpend = (rev != null && tx != null && tx > 0) ? (rev / tx) : null;
+      var variance = (rev != null) ? (rev - budget) : null;
+      var variancePct = (variance != null && budget > 0) ? (variance / budget * 100) : null;
+      if (rev != null) { totRev += rev; totBudget += budget; }
+      if (tx != null) totTx += tx;
+      if (rev != null && d.wagesSuper != null) { totWagesSuper += d.wagesSuper; anyWage = true; }
+
+      var tr = document.createElement('tr');
+      tr.style.cssText = 'border-top:1px solid var(--border-med);';
+      var tdDay = document.createElement('td'); tdDay.style.cssText = 'padding:5px 8px;white-space:nowrap;';
+      tdDay.textContent = DAY_NAMES[wd] + ' ' + d.date;
+      var tdSales = document.createElement('td'); tdSales.style.cssText = 'padding:5px 8px;text-align:right;font-weight:600;';
+      tdSales.textContent = (rev == null) ? '—' : fmtMoney(rev, false);
+      var tdBudget = document.createElement('td'); tdBudget.style.cssText = 'padding:5px 8px;text-align:right;color:var(--text-dim);';
+      tdBudget.textContent = fmtMoney(budget, false);
+      var tdVar = document.createElement('td'); tdVar.style.cssText = 'padding:5px 8px;text-align:right;';
+      if (variance == null) { tdVar.textContent = '—'; }
+      else {
+        tdVar.textContent = (variance >= 0 ? '+' : '') + fmtMoney(variance, false) + (variancePct != null ? ' (' + (variancePct >= 0 ? '+' : '') + Math.round(variancePct) + '%)' : '');
+        tdVar.style.color = variance >= 0 ? 'var(--c-green)' : 'var(--c-coral)';
+      }
+      var tdTx = document.createElement('td'); tdTx.style.cssText = 'padding:5px 8px;text-align:right;';
+      tdTx.textContent = (tx == null) ? '—' : tx;
+      var tdAvg = document.createElement('td'); tdAvg.style.cssText = 'padding:5px 8px;text-align:right;';
+      tdAvg.textContent = (avgSpend == null) ? '—' : fmtMoney(avgSpend, false);
+      var tdWage = document.createElement('td'); tdWage.style.cssText = 'padding:5px 8px;text-align:right;';
+      if (wagePct == null) { tdWage.textContent = '—'; }
+      else {
+        tdWage.textContent = Math.round(wagePct * 10) / 10 + '%';
+        if (targetBreached('wage', wagePct)) tdWage.style.color = 'var(--c-coral)';
+      }
+      [tdDay, tdSales, tdBudget, tdVar, tdTx, tdAvg, tdWage].forEach(function (td) { tr.appendChild(td); });
+      tbody.appendChild(tr);
+    });
+
+    var trTotal = document.createElement('tr');
+    trTotal.style.cssText = 'border-top:2px solid var(--border-med);font-weight:600;';
+    var totVariance = totRev - totBudget;
+    var totVariancePct = totBudget > 0 ? (totVariance / totBudget * 100) : null;
+    var totAvgSpend = totTx > 0 ? (totRev / totTx) : null;
+    var totWagePct = (anyWage && totRev > 0) ? (totWagesSuper / totRev * 100) : null;
+    var cellsHtml = [
+      'To date',
+      fmtMoney(totRev, false),
+      fmtMoney(totBudget, false),
+      (totVariance >= 0 ? '+' : '') + fmtMoney(totVariance, false) + (totVariancePct != null ? ' (' + (totVariancePct >= 0 ? '+' : '') + Math.round(totVariancePct) + '%)' : ''),
+      totTx,
+      totAvgSpend != null ? fmtMoney(totAvgSpend, false) : '—',
+      totWagePct != null ? (Math.round(totWagePct * 10) / 10 + '%') : '—'
+    ];
+    cellsHtml.forEach(function (v, i) {
+      var td = document.createElement('td');
+      td.style.cssText = 'padding:6px 8px;text-align:' + (i === 0 ? 'left' : 'right') + ';';
+      td.textContent = v;
+      trTotal.appendChild(td);
+    });
+    tbody.appendChild(trTotal);
+
+    scrollBox.appendChild(table);
+    body.appendChild(scrollBox);
+    if (!j.pos) {
+      var note = el('div', 'm-def', 'Connect Square to also see transactions and average spend per day.');
+      note.style.cssText = 'color:var(--text-dim);margin-top:0.4rem;';
+      body.appendChild(note);
+    }
+  }).catch(function () { body.textContent = 'Could not load this just now.'; });
+  return wrap;
 }
 
 function daypartExtraCard(r) {
@@ -1020,6 +1174,7 @@ function coversValue(slot) {
 }
 
 var DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+var DAY_NAMES_FULL = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 
 /* Day-by-day covers for whichever period is selected at the top of the
    dashboard (this week, last month, this financial year, custom range,
@@ -1040,11 +1195,10 @@ function coversPeriodTable(r) {
   scrollBox.style.cssText = 'max-height:280px;overflow-y:auto;border:1px solid var(--border-med);border-radius:8px;';
   var table = document.createElement('table');
   table.style.cssText = 'width:100%;border-collapse:collapse;font-size:13px;';
-  table.innerHTML = '<thead><tr>'
-    + '<th style="text-align:left;padding:6px 8px;color:var(--text-dim);font-weight:600;position:sticky;top:0;background:var(--bg-card);">Day</th>'
-    + '<th style="text-align:right;padding:6px 8px;color:var(--text-dim);font-weight:600;position:sticky;top:0;background:var(--bg-card);">Entered</th>'
-    + '<th style="text-align:right;padding:6px 8px;color:var(--text-dim);font-weight:600;position:sticky;top:0;background:var(--bg-card);">Running tally</th>'
-    + '</tr></thead><tbody></tbody>';
+  var cols = ['Day', 'Brunch', 'Lunch', 'Dinner', 'Total', 'Running tally'];
+  table.innerHTML = '<thead><tr>' + cols.map(function (c, i) {
+    return '<th style="text-align:' + (i === 0 ? 'left' : 'right') + ';padding:6px 8px;color:var(--text-dim);font-weight:600;position:sticky;top:0;background:var(--bg-card);">' + c + '</th>';
+  }).join('') + '</tr></thead><tbody></tbody>';
   var tbody = table.querySelector('tbody');
   days.forEach(function (d) {
     var row = document.createElement('tr');
@@ -1052,15 +1206,13 @@ function coversPeriodTable(r) {
     var tdDay = document.createElement('td');
     tdDay.style.cssText = 'padding:5px 8px;color:var(--text-dim);white-space:nowrap;';
     tdDay.textContent = DAY_NAMES[d.getUTCDay()] + ' ' + iso(d);
-    var tdVal = document.createElement('td');
-    tdVal.style.cssText = 'padding:5px 8px;text-align:right;font-weight:600;';
-    tdVal.textContent = '…';
-    var tdTally = document.createElement('td');
-    tdTally.style.cssText = 'padding:5px 8px;text-align:right;color:var(--text-dim);';
-    tdTally.textContent = '…';
     row.appendChild(tdDay);
-    row.appendChild(tdVal);
-    row.appendChild(tdTally);
+    for (var i = 0; i < 5; i++) {
+      var td = document.createElement('td');
+      td.style.cssText = 'padding:5px 8px;text-align:right;' + (i === 3 ? 'font-weight:600;' : i === 4 ? 'color:var(--text-dim);' : '');
+      td.textContent = '…';
+      row.appendChild(td);
+    }
     tbody.appendChild(row);
   });
   scrollBox.appendChild(table);
@@ -1071,25 +1223,31 @@ function coversPeriodTable(r) {
     .then(function (res) { return res.json(); })
     .then(function (j) {
       var byDate = {};
-      (j.days || []).forEach(function (row) { byDate[row.date] = row.covers; });
+      (j.days || []).forEach(function (row) { byDate[row.date] = row; });
       var rows = tbody.querySelectorAll('tr');
       var tally = 0;
       days.forEach(function (d, i) {
-        var v = byDate[iso(d)];
-        var tdVal = rows[i].children[1];
-        var tdTally = rows[i].children[2];
-        if (v == null) {
-          tdVal.textContent = 'not entered yet'; tdVal.style.fontWeight = '400'; tdVal.style.color = 'var(--text-dim)';
+        var row = byDate[iso(d)] || {};
+        var cells = rows[i].children;
+        var any = row.brunchCovers != null || row.lunchCovers != null || row.dinnerCovers != null || row.covers != null;
+        function put(td, v) { td.textContent = (v == null) ? '—' : v; }
+        put(cells[1], row.brunchCovers);
+        put(cells[2], row.lunchCovers);
+        put(cells[3], row.dinnerCovers);
+        if (!any) {
+          cells[4].textContent = 'not entered yet'; cells[4].style.fontWeight = '400'; cells[4].style.color = 'var(--text-dim)';
+        } else if (row.covers != null) {
+          cells[4].textContent = row.covers + ' covers';
+          tally += row.covers;
         } else {
-          tdVal.textContent = v + ' covers';
-          tally += v;
+          cells[4].textContent = '—';
         }
-        tdTally.textContent = tally + ' covers';
+        cells[5].textContent = tally + ' covers';
       });
     })
     .catch(function () {
       tbody.querySelectorAll('tr').forEach(function (row) {
-        row.children[1].textContent = '—'; row.children[2].textContent = '—';
+        for (var i = 1; i < 6; i++) row.children[i].textContent = '—';
       });
     });
   return wrap;
@@ -1118,34 +1276,53 @@ function coversExtraCard(cur, r) {
   wrap.appendChild(coversPeriodTable(r));
 
   var form = el('div', 'conn-actions');
-  form.style.marginTop = '0.8rem';
-  var hint = el('div', 'm-def', 'Pick any date, including previous weeks, to add or correct a day.');
+  form.style.cssText = 'margin-top:0.8rem;flex-wrap:wrap;align-items:flex-end;';
+  var hint = el('div', 'm-def', 'Pick any date, including previous weeks, to add or correct a day. Enter covers for each service.');
   hint.style.cssText = 'color:var(--text-dim);margin-bottom:0.3rem;';
   wrap.appendChild(hint);
   var dateIn = document.createElement('input');
   dateIn.type = 'date';
   dateIn.value = new Date().toISOString().slice(0, 10);
-  var numIn = document.createElement('input');
-  numIn.type = 'number'; numIn.min = '0'; numIn.placeholder = 'Covers count';
-  numIn.style.cssText = 'font-family:DM Sans,sans-serif;font-size:13px;padding:7px 10px;border:1px solid var(--border-med);border-radius:8px;width:110px;';
+
+  function coversField(labelText) {
+    var box = document.createElement('div');
+    box.style.cssText = 'display:flex;flex-direction:column;gap:2px;';
+    var lbl = document.createElement('label');
+    lbl.textContent = labelText;
+    lbl.style.cssText = 'font-size:11px;color:var(--text-dim);';
+    var inp = document.createElement('input');
+    inp.type = 'number'; inp.min = '0'; inp.placeholder = '0';
+    inp.style.cssText = 'font-family:DM Sans,sans-serif;font-size:13px;padding:7px 10px;border:1px solid var(--border-med);border-radius:8px;width:90px;';
+    box.appendChild(lbl);
+    box.appendChild(inp);
+    return { box: box, input: inp };
+  }
+  var brunchF = coversField('Brunch');
+  var lunchF = coversField('Lunch');
+  var dinnerF = coversField('Dinner');
   var saveBtn = el('button', 'btn-small', 'Save covers for that day');
   var msg = el('div', 'conn-line');
   msg.style.marginTop = '0.4rem';
   saveBtn.onclick = function () {
-    var dv = dateIn.value, n = parseInt(numIn.value, 10);
-    if (!dv || !isFinite(n) || n < 0) { msg.textContent = 'Enter a date and a covers count of 0 or more.'; return; }
+    var dv = dateIn.value;
+    var b = parseInt(brunchF.input.value, 10) || 0;
+    var l = parseInt(lunchF.input.value, 10) || 0;
+    var d = parseInt(dinnerF.input.value, 10) || 0;
+    if (!dv || b < 0 || l < 0 || d < 0) { msg.textContent = 'Enter a date and covers counts of 0 or more.'; return; }
     saveBtn.disabled = true; msg.textContent = 'Saving…';
-    fetch('/api/covers', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ date: dv, covers: n }) })
+    fetch('/api/covers', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ date: dv, brunch: b, lunch: l, dinner: d }) })
       .then(function (res) { return res.json().then(function (j) { return { ok: res.ok, j: j }; }); })
       .then(function (out) {
         saveBtn.disabled = false;
-        if (out.ok) { msg.textContent = 'Saved for ' + dv + '.'; numIn.value = ''; fetchData(true); }
+        if (out.ok) { msg.textContent = 'Saved for ' + dv + ' · ' + (b + l + d) + ' covers total.'; brunchF.input.value = ''; lunchF.input.value = ''; dinnerF.input.value = ''; fetchData(true); }
         else { msg.textContent = 'Could not save that. Try again.'; }
       })
       .catch(function () { saveBtn.disabled = false; msg.textContent = 'Something went wrong. Try again.'; });
   };
   form.appendChild(dateIn);
-  form.appendChild(numIn);
+  form.appendChild(brunchF.box);
+  form.appendChild(lunchF.box);
+  form.appendChild(dinnerF.box);
   form.appendChild(saveBtn);
   wrap.appendChild(form);
   wrap.appendChild(msg);
@@ -2211,6 +2388,32 @@ function renderSettings(root) {
     tgrid.appendChild(cell);
   });
   root.appendChild(tgrid);
+
+  /* Daily revenue budget - one target per day of week, since a hospitality
+     week isn't flat (a quiet Monday vs a busy Saturday). Feeds the daily
+     takings-vs-budget table; comparison is done in the browser, so nothing
+     here touches Xero or the locked Revenue definition. */
+  root.appendChild(el('div', 'screen-title', 'Daily revenue budget'));
+  root.appendChild(el('p', 'screen-sub', 'Set what you expect to take on each day of the week, ex-GST. The daily takings table compares each day against the figure for that weekday.'));
+  var bgrid = el('div', 'set-grid');
+  if (!SETTINGS.dailyBudget || !Array.isArray(SETTINGS.dailyBudget) || SETTINGS.dailyBudget.length !== 7) {
+    SETTINGS.dailyBudget = [0, 0, 0, 0, 0, 0, 0];
+  }
+  DAY_NAMES_FULL.forEach(function (name, idx) {
+    var cell = el('div', 'set-cell');
+    cell.appendChild(el('div', 'set-label', name));
+    var inp = document.createElement('input'); inp.type = 'number'; inp.step = 'any'; inp.min = '0';
+    inp.value = SETTINGS.dailyBudget[idx] || '';
+    inp.placeholder = KIT_CONFIG.currency + ' amount';
+    inp.onchange = function () {
+      var val = parseFloat(inp.value);
+      SETTINGS.dailyBudget[idx] = isFinite(val) ? val : 0;
+      saveSettings(); render();
+    };
+    cell.appendChild(inp);
+    bgrid.appendChild(cell);
+  });
+  root.appendChild(bgrid);
 
   if (!isManual()) {
     root.appendChild(el('div', 'section-sub', 'Session'));

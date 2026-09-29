@@ -796,14 +796,16 @@ async function readIngestedDaily(env, source, from, to) {
   const dates = eachDate(from, to);
   return Promise.all(dates.map(async (date) => {
     const raw = await env.TOKENS.get('data:' + source + ':' + date);
-    let value = null;
+    const row = { date, covers: null, brunchCovers: null, lunchCovers: null, dinnerCovers: null };
     if (raw) {
       try {
-        const row = JSON.parse(raw);
-        if (typeof row.covers === 'number' && isFinite(row.covers)) value = row.covers;
+        const parsed = JSON.parse(raw);
+        for (const k of ['covers', 'brunchCovers', 'lunchCovers', 'dinnerCovers']) {
+          if (typeof parsed[k] === 'number' && isFinite(parsed[k])) row[k] = parsed[k];
+        }
       } catch (e) { /* skip bad row */ }
     }
-    return { date, covers: value };
+    return row;
   }));
 }
 
@@ -923,11 +925,14 @@ async function coversSumFor(env, range) {
 async function apiCovers(env, request) {
   let body; try { body = await request.json(); } catch (e) { return json({ ok: false }, 400); }
   const date = String((body && body.date) || '');
-  const covers = Number(body && body.covers);
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !isFinite(covers) || covers < 0) {
+  const brunch = Number(body && body.brunch);
+  const lunch = Number(body && body.lunch);
+  const dinner = Number(body && body.dinner);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || ![brunch, lunch, dinner].every((n) => isFinite(n) && n >= 0)) {
     return json({ ok: false, error: 'bad input' }, 400);
   }
-  await saveIngestedRows(env, 'covers', [{ date, covers }]);
+  const covers = brunch + lunch + dinner;
+  await saveIngestedRows(env, 'covers', [{ date, covers, brunchCovers: brunch, lunchCovers: lunch, dinnerCovers: dinner }]);
   await noteSync(env, 'covers');
   return json({ ok: true });
 }
@@ -943,6 +948,95 @@ async function apiCoversDaily(env, url) {
   }
   const days = await readIngestedDaily(env, 'covers', from, to);
   return json({ days });
+}
+
+/* ---------------- Daily figures: day-of-week pattern + takings vs budget --
+   Both extras, added at the owner's request, share one endpoint: per-day
+   Revenue and wages+super from Xero (kpi-spec's own definitions, just at
+   daily grain - not a redefinition), and per-day completed-transaction
+   count from Square. Budget comparison and weekday grouping are computed
+   in the browser from SETTINGS, which already holds the owner's targets. */
+
+/* Which trading day (YYYY-MM-DD) an instant falls in, in the venue's
+   timezone, honouring the rollover hour - same rule used everywhere else
+   (sales before the rollover hour count to the previous trading day). */
+function tradingDateInTz(iso, tz, rollover) {
+  const dtf = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', hour12: false });
+  const parts = {};
+  dtf.formatToParts(new Date(iso)).forEach((p) => { parts[p.type] = p.value; });
+  let y = +parts.year, mo = +parts.month, d = +parts.day;
+  const h = +(parts.hour === '24' ? 0 : parts.hour);
+  if (h < rollover) { const prev = addDaysUTCDateParts(y, mo, d, -1); y = prev.y; mo = prev.m; d = prev.d; }
+  return y + '-' + String(mo).padStart(2, '0') + '-' + String(d).padStart(2, '0');
+}
+
+/* One Square Orders call for the whole range, bucketed into trading days -
+   far cheaper than one call per day, and Square has no per-day report we'd
+   need anyway (count only, per kpi-spec.md rule 2). */
+async function squareCountsByDay(env, from, to, tz, rollover) {
+  const orders = await squareFetchOrdersFull(env, from, to, tz, rollover);
+  const counts = {};
+  for (const o of orders) {
+    const d = tradingDateInTz(o.closed_at, tz, rollover);
+    counts[d] = (counts[d] || 0) + 1;
+  }
+  return counts;
+}
+
+/* Per-day Xero Revenue + wages/super, one Reports/ProfitAndLoss call per
+   day (the same report the period totals already use, just for a single
+   date). Xero's per-tenant cap is 5 calls in flight and 60/minute
+   (developer.xero.com/faq/limits) - chunked at 5 concurrent, well inside
+   both. A day strictly before today (venue time) is closed and cached
+   indefinitely in KV; today's figure is always pulled live since it can
+   still move during trading. */
+async function dailyAccountingFigures(env, dates, tz) {
+  const todayStr = tradingDateInTz(new Date().toISOString(), tz, 0);
+  const h = makeHelpers(env, 'accounting');
+  const out = {};
+  const CHUNK = 5;
+  for (let start = 0; start < dates.length; start += CHUNK) {
+    const chunk = dates.slice(start, start + CHUNK);
+    await Promise.all(chunk.map(async (date) => {
+      if (date < todayStr) {
+        const cached = await env.TOKENS.get('data:accounting-daily:' + date);
+        if (cached) { try { out[date] = JSON.parse(cached); return; } catch (e) { /* refetch */ } }
+      }
+      try {
+        const r = await ADAPTERS.accounting.fetchRange(env, h, { from: date, to: date });
+        out[date] = { revenue: r.revenue ?? null, wagesSuper: r.wagesSuper ?? null };
+        if (date < todayStr) await env.TOKENS.put('data:accounting-daily:' + date, JSON.stringify(out[date]));
+      } catch (err) {
+        out[date] = { revenue: null, wagesSuper: null };
+      }
+    }));
+  }
+  return out;
+}
+
+/* GET /api/extras/daily?cur=FROM:TO - per-day Revenue, wages+super
+   (Xero) and transaction count (Square) for the range. Powers both the
+   day-of-week pattern and the daily takings-vs-budget table; each is
+   free to slice/group this the way it needs. */
+async function apiDaily(env, url) {
+  const cur = parseRange(url.searchParams.get('cur'));
+  if (!cur) return json({ error: 'bad cur range' }, 400);
+  const tz = url.searchParams.get('tz') || 'Australia/Sydney';
+  const rollover = Math.max(0, Math.min(6, parseInt(url.searchParams.get('rollover') || '0', 10) || 0));
+  const accOn = ADAPTERS.accounting.configured;
+  const posOn = ADAPTERS.pos.configured && !!env.POS_API_TOKEN;
+  const dates = eachDate(cur.from, cur.to);
+  const [acc, counts] = await Promise.all([
+    accOn ? dailyAccountingFigures(env, dates, tz) : Promise.resolve({}),
+    posOn ? squareCountsByDay(env, cur.from, cur.to, tz, rollover).catch(() => ({})) : Promise.resolve({})
+  ]);
+  const days = dates.map((date) => ({
+    date,
+    revenue: accOn ? (acc[date] ? acc[date].revenue : null) : null,
+    wagesSuper: accOn ? (acc[date] ? acc[date].wagesSuper : null) : null,
+    transactions: posOn ? (counts[date] || 0) : null
+  }));
+  return json({ accounting: accOn, pos: posOn, days });
 }
 
 /* ---------------- Square extras: daypart split + top/bottom sellers ------
@@ -1256,6 +1350,10 @@ export default {
     if (path === '/api/extras/sellers' && request.method === 'GET') {
       if (!loggedIn) return json({ error: 'auth' }, 401);
       return apiSellers(env, url);
+    }
+    if (path === '/api/extras/daily' && request.method === 'GET') {
+      if (!loggedIn) return json({ error: 'auth' }, 401);
+      return apiDaily(env, url);
     }
     const authRoute = /^\/auth\/(accounting|pos|rostering)\/(start|callback)$/.exec(path);
     if (authRoute && request.method === 'GET') {
