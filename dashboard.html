@@ -1233,7 +1233,7 @@ var DAY_NAMES_FULL = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'F
    always matches what's on screen. Shows what's been entered per day and
    a running tally alongside it. Long periods (a financial year) scroll
    inside a fixed-height box rather than stretching the card. */
-function coversPeriodTable(r) {
+function coversPeriodTable(r, onPick) {
   var days = [];
   var cursor = r.from;
   while (cursor.getTime() <= r.to.getTime() && days.length < 400) {
@@ -1280,6 +1280,14 @@ function coversPeriodTable(r) {
       days.forEach(function (d, i) {
         var row = byDate[iso(d)] || {};
         var cells = rows[i].children;
+        if (onPick) {
+          var dayCell = cells[0];
+          dayCell.style.cursor = 'pointer';
+          dayCell.style.textDecoration = 'underline';
+          dayCell.style.color = 'var(--accent)';
+          dayCell.title = 'Click to add or edit covers for this day';
+          dayCell.onclick = (function (dateStr, rowData) { return function () { onPick(dateStr, rowData); }; })(iso(d), row);
+        }
         var any = row.brunchCovers != null || row.lunchCovers != null || row.dinnerCovers != null || row.covers != null;
         function put(td, v) { td.textContent = (v == null) ? '—' : v; }
         put(cells[1], row.brunchCovers);
@@ -1324,7 +1332,15 @@ function coversExtraCard(cur, r) {
     wrap.appendChild(el('div', 'm-def', 'Revenue ÷ covers · ' + covers + ' covers entered for ' + fmtRange(r)));
   }
 
-  wrap.appendChild(coversPeriodTable(r));
+  wrap.appendChild(coversPeriodTable(r, function (dateStr, rowData) {
+    dateIn.value = dateStr;
+    brunchF.input.value = (rowData && rowData.brunchCovers != null) ? rowData.brunchCovers : '';
+    lunchF.input.value = (rowData && rowData.lunchCovers != null) ? rowData.lunchCovers : '';
+    dinnerF.input.value = (rowData && rowData.dinnerCovers != null) ? rowData.dinnerCovers : '';
+    msg.textContent = 'Editing ' + dateStr + ' — change the numbers and press save.';
+    form.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    brunchF.input.focus();
+  }));
 
   var form = el('div', 'conn-actions');
   form.style.cssText = 'margin-top:0.8rem;flex-wrap:wrap;align-items:flex-end;';
