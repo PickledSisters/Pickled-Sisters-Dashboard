@@ -958,49 +958,103 @@ function extrasApiUrl(path, r) {
    /api/extras/daily payload (per-day Revenue/wages from Xero, transactions
    from Square). Not part of kpi-spec.md's locked six/seven; budget and
    wage-target comparisons use SETTINGS, exactly like the core cards do. */
+var DAILY_CACHE = {};
 function fetchDailyExtras(r) {
-  return fetch(extrasApiUrl('/api/extras/daily', r)).then(function (res) { return res.json(); });
+  /* One shared fetch per range per minute, so the two daily cards (and last
+     year's matching range) don't each hammer Xero separately. */
+  var url = extrasApiUrl('/api/extras/daily', r);
+  var hit = DAILY_CACHE[url];
+  if (hit && Date.now() - hit.t < 60000) return hit.p;
+  var p = fetch(url).then(function (res) { return res.json(); });
+  DAILY_CACHE[url] = { t: Date.now(), p: p };
+  p.catch(function () { delete DAILY_CACHE[url]; });
+  return p;
+}
+
+/* Same weekdays last year: shifted back 364 days (52 weeks), so a Saturday
+   is compared with a Saturday, not with whatever the same calendar date was. */
+function lastYearRange(r) {
+  return { from: addDays(r.from, -364), to: addDays(r.to, -364) };
+}
+function fetchDailyPair(r) {
+  return Promise.all([
+    fetchDailyExtras(r),
+    fetchDailyExtras(lastYearRange(r)).catch(function () { return null; })
+  ]).then(function (arr) { return { cur: arr[0], ly: arr[1] }; });
+}
+
+function pctChange(now, then) {
+  if (now == null || then == null || then === 0) return null;
+  return (now - then) / then * 100;
+}
+function fmtPct(p) {
+  return (p >= 0 ? '+' : '') + Math.round(p) + '%';
 }
 
 function dayOfWeekCard(r) {
   var wrap = el('div', 'mcard fade-in');
   wrap.style.marginTop = '1rem';
-  wrap.appendChild(el('div', 'm-label', 'Trading pattern by day of week · extra, averages for ' + fmtRange(r)));
+  wrap.appendChild(el('div', 'm-label', 'Trading pattern by day of week · extra, averages for ' + fmtRange(r) + ' vs same weekdays last year'));
   var body = el('div', 'm-def', 'Loading…');
   wrap.appendChild(body);
-  fetchDailyExtras(r).then(function (j) {
+  fetchDailyPair(r).then(function (pair) {
+    var j = pair.cur, ly = pair.ly;
     body.innerHTML = '';
     if (!j.accounting && !j.pos) { body.textContent = 'Not configured — connect Xero or Square first.'; return; }
-    var buckets = [0, 1, 2, 3, 4, 5, 6].map(function () { return { revSum: 0, revN: 0, txSum: 0, txN: 0 }; });
-    (j.days || []).forEach(function (d) {
-      var wd = fromIso(d.date).getUTCDay();
-      if (d.revenue != null) { buckets[wd].revSum += d.revenue; buckets[wd].revN++; }
-      if (d.transactions != null) { buckets[wd].txSum += d.transactions; buckets[wd].txN++; }
-    });
+    function bucketise(data) {
+      var buckets = [0, 1, 2, 3, 4, 5, 6].map(function () { return { revSum: 0, revN: 0, txSum: 0, txN: 0 }; });
+      ((data && data.days) || []).forEach(function (d) {
+        var wd = fromIso(d.date).getUTCDay();
+        if (d.revenue != null && d.revenue > 0) { buckets[wd].revSum += d.revenue; buckets[wd].revN++; }
+        if (d.transactions != null && d.transactions > 0) { buckets[wd].txSum += d.transactions; buckets[wd].txN++; }
+      });
+      return buckets;
+    }
+    var cb = bucketise(j), lb = bucketise(ly);
+    var cols = ['Day', 'Avg revenue', 'Last year', 'Change', 'Avg trans', 'Last year', 'Change'];
     var table = document.createElement('table');
     table.style.cssText = 'width:100%;border-collapse:collapse;font-size:13px;';
-    table.innerHTML = '<thead><tr>'
-      + '<th style="text-align:left;padding:6px 8px;color:var(--text-dim);font-weight:600;">Day</th>'
-      + '<th style="text-align:right;padding:6px 8px;color:var(--text-dim);font-weight:600;">Avg revenue</th>'
-      + '<th style="text-align:right;padding:6px 8px;color:var(--text-dim);font-weight:600;">Avg transactions</th>'
-      + '<th style="text-align:right;padding:6px 8px;color:var(--text-dim);font-weight:600;">Weeks sampled</th>'
-      + '</tr></thead><tbody></tbody>';
+    table.innerHTML = '<thead><tr>' + cols.map(function (c, i) {
+      return '<th style="text-align:' + (i === 0 ? 'left' : 'right') + ';padding:6px 8px;color:var(--text-dim);font-weight:600;">' + c + '</th>';
+    }).join('') + '</tr></thead><tbody></tbody>';
     var tbody = table.querySelector('tbody');
-    for (var wd = 0; wd < 7; wd++) {
-      var b = buckets[wd];
+    /* Trading days only: closed days ($0 / no sales) are left out of the
+       averages so a day you don't open doesn't drag them down. */
+    for (var k = 0; k < 7; k++) {
+      var wd = (+SETTINGS.weekStart + k) % 7;
+      var b = cb[wd], l = lb[wd];
+      var revNow = (j.accounting && b.revN) ? b.revSum / b.revN : null;
+      var revLy = (ly && ly.accounting && l.revN) ? l.revSum / l.revN : null;
+      var txNow = (j.pos && b.txN) ? b.txSum / b.txN : null;
+      var txLy = (ly && ly.pos && l.txN) ? l.txSum / l.txN : null;
+      var revCh = pctChange(revNow, revLy), txCh = pctChange(txNow, txLy);
+      var cells = [
+        DAY_NAMES_FULL[wd],
+        revNow == null ? '—' : fmtMoney(revNow, false),
+        revLy == null ? '—' : fmtMoney(revLy, false),
+        revCh == null ? '—' : fmtPct(revCh),
+        txNow == null ? '—' : String(Math.round(txNow * 10) / 10),
+        txLy == null ? '—' : String(Math.round(txLy * 10) / 10),
+        txCh == null ? '—' : fmtPct(txCh)
+      ];
       var tr = document.createElement('tr');
       tr.style.cssText = 'border-top:1px solid var(--border-med);';
-      var tdDay = document.createElement('td'); tdDay.style.cssText = 'padding:5px 8px;'; tdDay.textContent = DAY_NAMES_FULL[wd];
-      var tdRev = document.createElement('td'); tdRev.style.cssText = 'padding:5px 8px;text-align:right;font-weight:600;';
-      tdRev.textContent = (j.accounting && b.revN) ? fmtMoney(b.revSum / b.revN, false) : '—';
-      var tdTx = document.createElement('td'); tdTx.style.cssText = 'padding:5px 8px;text-align:right;';
-      tdTx.textContent = (j.pos && b.txN) ? (Math.round(b.txSum / b.txN * 10) / 10) : '—';
-      var tdN = document.createElement('td'); tdN.style.cssText = 'padding:5px 8px;text-align:right;color:var(--text-dim);';
-      tdN.textContent = Math.max(b.revN, b.txN);
-      tr.appendChild(tdDay); tr.appendChild(tdRev); tr.appendChild(tdTx); tr.appendChild(tdN);
+      cells.forEach(function (v, i) {
+        var td = document.createElement('td');
+        td.style.cssText = 'padding:5px 8px;text-align:' + (i === 0 ? 'left' : 'right') + ';' + (i === 1 || i === 4 ? 'font-weight:600;' : '') + ((i === 2 || i === 5) ? 'color:var(--text-dim);' : '');
+        td.textContent = v;
+        if (i === 3 && revCh != null) td.style.color = revCh >= 0 ? 'var(--c-green)' : 'var(--c-coral)';
+        if (i === 6 && txCh != null) td.style.color = txCh >= 0 ? 'var(--c-green)' : 'var(--c-coral)';
+        tr.appendChild(td);
+      });
       tbody.appendChild(tr);
     }
     body.appendChild(table);
+    if (!ly) {
+      var note = el('div', 'm-def', 'Last year’s figures could not be loaded just now.');
+      note.style.cssText = 'color:var(--text-dim);margin-top:0.4rem;';
+      body.appendChild(note);
+    }
   }).catch(function () { body.textContent = 'Could not load this just now.'; });
   return wrap;
 }
@@ -1008,54 +1062,55 @@ function dayOfWeekCard(r) {
 function dailyTakingsCard(r) {
   var wrap = el('div', 'mcard fade-in');
   wrap.style.marginTop = '1rem';
-  wrap.appendChild(el('div', 'm-label', 'Daily takings vs budget · extra, ' + fmtRange(r)));
+  wrap.appendChild(el('div', 'm-label', 'Daily takings vs budget · extra, ' + fmtRange(r) + ' · last year = same weekday, 52 weeks earlier'));
   var body = el('div', 'm-def', 'Loading…');
   wrap.appendChild(body);
-  fetchDailyExtras(r).then(function (j) {
+  fetchDailyPair(r).then(function (pair) {
+    var j = pair.cur, ly = pair.ly;
     body.innerHTML = '';
     if (!j.accounting) { body.textContent = 'Not configured — connect Xero first (this needs daily Revenue).'; return; }
     var days = j.days || [];
     if (!days.length) { body.textContent = 'No days in this range.'; return; }
+    var lyDays = (ly && ly.days) || [];
     var scrollBox = document.createElement('div');
     scrollBox.style.cssText = 'max-height:340px;overflow-y:auto;border:1px solid var(--border-med);border-radius:8px;';
     var table = document.createElement('table');
     table.style.cssText = 'width:100%;border-collapse:collapse;font-size:13px;';
-    var cols = ['Day', 'Net sales', 'Budget', 'Variance', 'Trans', 'Avg spend'];
+    var cols = ['Day', 'Net sales', 'Budget', 'Variance', 'Same day LY', 'vs LY', 'Trans', 'Trans LY', 'Avg spend'];
     table.innerHTML = '<thead><tr>' + cols.map(function (c, i) {
       return '<th style="text-align:' + (i === 0 ? 'left' : 'right') + ';padding:6px 8px;color:var(--text-dim);font-weight:600;position:sticky;top:0;background:var(--bg-card);">' + c + '</th>';
     }).join('') + '</tr></thead><tbody></tbody>';
     var tbody = table.querySelector('tbody');
-    var totRev = 0, totBudget = 0, totTx = 0;
-    days.forEach(function (d) {
+    var totRev = 0, totBudget = 0, totTx = 0, totLyRev = 0, totLyTx = 0;
+    days.forEach(function (d, i) {
       var wd = fromIso(d.date).getUTCDay();
       var budget = (SETTINGS.dailyBudget && typeof SETTINGS.dailyBudget[wd] === 'number') ? SETTINGS.dailyBudget[wd] : 0;
-      var rev = d.revenue;
-      var tx = d.transactions;
+      var rev = d.revenue, tx = d.transactions;
+      var lyd = lyDays[i] || {};
+      var lyRev = lyd.revenue, lyTx = lyd.transactions;
       var avgSpend = (rev != null && tx != null && tx > 0) ? (rev / tx) : null;
       var variance = (rev != null) ? (rev - budget) : null;
       var variancePct = (variance != null && budget > 0) ? (variance / budget * 100) : null;
+      var lyCh = pctChange(rev, lyRev);
       if (rev != null) { totRev += rev; totBudget += budget; }
       if (tx != null) totTx += tx;
+      if (lyRev != null) totLyRev += lyRev;
+      if (lyTx != null) totLyTx += lyTx;
 
       var tr = document.createElement('tr');
       tr.style.cssText = 'border-top:1px solid var(--border-med);';
-      var tdDay = document.createElement('td'); tdDay.style.cssText = 'padding:5px 8px;white-space:nowrap;';
-      tdDay.textContent = DAY_NAMES[wd] + ' ' + d.date;
-      var tdSales = document.createElement('td'); tdSales.style.cssText = 'padding:5px 8px;text-align:right;font-weight:600;';
-      tdSales.textContent = (rev == null) ? '—' : fmtMoney(rev, false);
-      var tdBudget = document.createElement('td'); tdBudget.style.cssText = 'padding:5px 8px;text-align:right;color:var(--text-dim);';
-      tdBudget.textContent = fmtMoney(budget, false);
-      var tdVar = document.createElement('td'); tdVar.style.cssText = 'padding:5px 8px;text-align:right;';
-      if (variance == null) { tdVar.textContent = '—'; }
-      else {
-        tdVar.textContent = (variance >= 0 ? '+' : '') + fmtMoney(variance, false) + (variancePct != null ? ' (' + (variancePct >= 0 ? '+' : '') + Math.round(variancePct) + '%)' : '');
-        tdVar.style.color = variance >= 0 ? 'var(--c-green)' : 'var(--c-coral)';
-      }
-      var tdTx = document.createElement('td'); tdTx.style.cssText = 'padding:5px 8px;text-align:right;';
-      tdTx.textContent = (tx == null) ? '—' : tx;
-      var tdAvg = document.createElement('td'); tdAvg.style.cssText = 'padding:5px 8px;text-align:right;';
-      tdAvg.textContent = (avgSpend == null) ? '—' : fmtMoney(avgSpend, false);
-      [tdDay, tdSales, tdBudget, tdVar, tdTx, tdAvg].forEach(function (td) { tr.appendChild(td); });
+      function td(text, style) { var c = document.createElement('td'); c.style.cssText = 'padding:5px 8px;text-align:right;' + (style || ''); c.textContent = text; tr.appendChild(c); return c; }
+      var tdDay = td(DAY_NAMES[wd] + ' ' + d.date, 'text-align:left;white-space:nowrap;');
+      td(rev == null ? '—' : fmtMoney(rev, false), 'font-weight:600;');
+      td(fmtMoney(budget, false), 'color:var(--text-dim);');
+      var tdVar = td(variance == null ? '—' : ((variance >= 0 ? '+' : '') + fmtMoney(variance, false) + (variancePct != null ? ' (' + fmtPct(variancePct) + ')' : '')));
+      if (variance != null) tdVar.style.color = variance >= 0 ? 'var(--c-green)' : 'var(--c-coral)';
+      td(lyRev == null ? '—' : fmtMoney(lyRev, false), 'color:var(--text-dim);');
+      var tdCh = td(lyCh == null ? '—' : fmtPct(lyCh));
+      if (lyCh != null) tdCh.style.color = lyCh >= 0 ? 'var(--c-green)' : 'var(--c-coral)';
+      td(tx == null ? '—' : tx);
+      td(lyTx == null ? '—' : lyTx, 'color:var(--text-dim);');
+      td(avgSpend == null ? '—' : fmtMoney(avgSpend, false));
       tbody.appendChild(tr);
     });
 
@@ -1063,30 +1118,36 @@ function dailyTakingsCard(r) {
     trTotal.style.cssText = 'border-top:2px solid var(--border-med);font-weight:600;';
     var totVariance = totRev - totBudget;
     var totVariancePct = totBudget > 0 ? (totVariance / totBudget * 100) : null;
-    var totAvgSpend = totTx > 0 ? (totRev / totTx) : null;
-    var cellsHtml = [
-      'To date',
+    var totLyCh = totLyRev > 0 ? pctChange(totRev, totLyRev) : null;
+    var totAvg = totTx > 0 ? (totRev / totTx) : null;
+    [
+      'Total',
       fmtMoney(totRev, false),
       fmtMoney(totBudget, false),
-      (totVariance >= 0 ? '+' : '') + fmtMoney(totVariance, false) + (totVariancePct != null ? ' (' + (totVariancePct >= 0 ? '+' : '') + Math.round(totVariancePct) + '%)' : ''),
+      (totVariance >= 0 ? '+' : '') + fmtMoney(totVariance, false) + (totVariancePct != null ? ' (' + fmtPct(totVariancePct) + ')' : ''),
+      ly ? fmtMoney(totLyRev, false) : '—',
+      totLyCh != null ? fmtPct(totLyCh) : '—',
       totTx,
-      totAvgSpend != null ? fmtMoney(totAvgSpend, false) : '—'
-    ];
-    cellsHtml.forEach(function (v, i) {
-      var td = document.createElement('td');
-      td.style.cssText = 'padding:6px 8px;text-align:' + (i === 0 ? 'left' : 'right') + ';';
-      td.textContent = v;
-      trTotal.appendChild(td);
+      ly ? totLyTx : '—',
+      totAvg != null ? fmtMoney(totAvg, false) : '—'
+    ].forEach(function (v, i) {
+      var c = document.createElement('td');
+      c.style.cssText = 'padding:6px 8px;text-align:' + (i === 0 ? 'left' : 'right') + ';';
+      c.textContent = v;
+      trTotal.appendChild(c);
     });
     tbody.appendChild(trTotal);
 
     scrollBox.appendChild(table);
     body.appendChild(scrollBox);
-    if (!j.pos) {
-      var note = el('div', 'm-def', 'Connect Square to also see transactions and average spend per day.');
+    var notes = [];
+    if (!j.pos) notes.push('Connect Square to also see transactions and average spend per day.');
+    if (!ly) notes.push('Last year’s figures could not be loaded just now.');
+    notes.forEach(function (t) {
+      var note = el('div', 'm-def', t);
       note.style.cssText = 'color:var(--text-dim);margin-top:0.4rem;';
       body.appendChild(note);
-    }
+    });
   }).catch(function () { body.textContent = 'Could not load this just now.'; });
   return wrap;
 }
