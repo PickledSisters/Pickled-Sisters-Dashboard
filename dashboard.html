@@ -756,7 +756,7 @@ function render() {
   var nav = el('div', 'nav');
   var tabs = isManual()
     ? [ { key: 'dashboard', label: 'Dashboard' }, { key: 'enter', label: 'Enter numbers' }, { key: 'settings', label: 'Settings' } ]
-    : [ { key: 'dashboard', label: 'Dashboard' }, { key: 'connections', label: 'Connections' }, { key: 'recon', label: 'Check your numbers' }, { key: 'settings', label: 'Settings' } ];
+    : [ { key: 'dashboard', label: 'Dashboard' }, { key: 'connections', label: 'Connections' }, { key: 'budget', label: 'Budget' }, { key: 'recon', label: 'Check your numbers' }, { key: 'settings', label: 'Settings' } ];
   tabs.forEach(function (t) {
     var b = el('button', 'nav-tab' + (state.view === t.key ? ' active' : ''));
     b.innerHTML = t.label + ((t.key === 'recon' && anyConfiguredSource() && unconfirmedConnectedMetrics().length) ? '<span class="dot"></span>' : '');
@@ -793,6 +793,7 @@ function render() {
   else if (state.view === 'enter') renderManualEntry(root);
   else if (state.view === 'connections') renderConnections(root);
   else if (state.view === 'recon') renderRecon(root);
+  else if (state.view === 'budget') renderBudget(root);
   else renderSettings(root);
 
   /* Footer */
@@ -1065,7 +1066,9 @@ function dailyTakingsCard(r) {
   wrap.appendChild(el('div', 'm-label', 'Daily takings vs budget · extra, ' + fmtRange(r) + ' · last year = same weekday, 52 weeks earlier'));
   var body = el('div', 'm-def', 'Loading…');
   wrap.appendChild(body);
-  fetchDailyPair(r).then(function (pair) {
+  Promise.all([fetchDailyPair(r), fetch('/api/extras/wages-daily?from=' + iso(r.from) + '&to=' + iso(r.to)).then(function (x) { return x.json(); }).catch(function () { return { days: [] }; })]).then(function (both) {
+    var pair = both[0]; var wmap = {};
+    (both[1].days || []).forEach(function (w) { wmap[w.date] = w.wages; });
     var j = pair.cur, ly = pair.ly;
     body.innerHTML = '';
     if (!j.accounting) { body.textContent = 'Not configured — connect Xero first (this needs daily Revenue).'; return; }
@@ -1076,12 +1079,12 @@ function dailyTakingsCard(r) {
     scrollBox.style.cssText = 'max-height:340px;overflow-y:auto;border:1px solid var(--border-med);border-radius:8px;';
     var table = document.createElement('table');
     table.style.cssText = 'width:100%;border-collapse:collapse;font-size:13px;';
-    var cols = ['Day', 'Net sales', 'Budget', 'Variance', 'Same day LY', 'vs LY', 'Trans', 'Trans LY', 'Avg spend'];
+    var cols = ['Day', 'Net sales', 'Budget', 'Variance', 'Same day LY', 'vs LY', 'Trans', 'Trans LY', 'Avg spend', 'Wages', 'Wage %'];
     table.innerHTML = '<thead><tr>' + cols.map(function (c, i) {
       return '<th style="text-align:' + (i === 0 ? 'left' : 'right') + ';padding:6px 8px;color:var(--text-dim);font-weight:600;position:sticky;top:0;background:var(--bg-card);">' + c + '</th>';
     }).join('') + '</tr></thead><tbody></tbody>';
     var tbody = table.querySelector('tbody');
-    var totRev = 0, totBudget = 0, totTx = 0, totLyRev = 0, totLyTx = 0;
+    var totRev = 0, totBudget = 0, totTx = 0, totLyRev = 0, totLyTx = 0, totWages = 0, totRevW = 0;
     days.forEach(function (d, i) {
       var wd = fromIso(d.date).getUTCDay();
       var budget = (SETTINGS.dailyBudget && typeof SETTINGS.dailyBudget[wd] === 'number') ? SETTINGS.dailyBudget[wd] : 0;
@@ -1111,6 +1114,12 @@ function dailyTakingsCard(r) {
       td(tx == null ? '—' : tx);
       td(lyTx == null ? '—' : lyTx, 'color:var(--text-dim);');
       td(avgSpend == null ? '—' : fmtMoney(avgSpend, false));
+      var wv = (typeof wmap[d.date] === 'number') ? wmap[d.date] : null;
+      var wp = (wv != null && rev != null && rev > 0) ? (wv / rev * 100) : null;
+      if (wv != null && rev != null && rev > 0) { totWages += wv; totRevW += rev; }
+      td(wv == null ? '—' : fmtMoney(wv, false));
+      var tdWp = td(wp == null ? '—' : (Math.round(wp * 10) / 10 + '%'));
+      if (wp != null && targetBreached('wage', wp)) tdWp.style.color = 'var(--c-coral)';
       tbody.appendChild(tr);
     });
 
@@ -1129,7 +1138,9 @@ function dailyTakingsCard(r) {
       totLyCh != null ? fmtPct(totLyCh) : '—',
       totTx,
       ly ? totLyTx : '—',
-      totAvg != null ? fmtMoney(totAvg, false) : '—'
+      totAvg != null ? fmtMoney(totAvg, false) : '—',
+      totRevW > 0 ? fmtMoney(totWages, false) : '—',
+      totRevW > 0 ? (Math.round(totWages / totRevW * 1000) / 10 + '%') : '—'
     ].forEach(function (v, i) {
       var c = document.createElement('td');
       c.style.cssText = 'padding:6px 8px;text-align:' + (i === 0 ? 'left' : 'right') + ';';
@@ -2335,6 +2346,248 @@ function renderManualEntry(root) {
       root.appendChild(el('div', 'manual-row', esc(fmtRange({ from: fromIso(e.from), to: fromIso(e.to) })) + ' \u00b7 saved'));
     });
   }
+}
+
+/* ============================================================
+   Budget tab (extra, not one of the core seven). The owner's weekly budget
+   (pay weeks Tue-Mon) against Xero actuals (ex-GST) and the daily wages the
+   owner types in from Urhere. Budget is stored on the dashboard (KV), not in
+   the browser, so it survives a change of device.
+============================================================ */
+var BUDGET = { data: null };
+
+function parseBudgetCsv(text) {
+  var lines = text.replace(/\r/g, '').split('\n').filter(function (l) { return l.trim(); });
+  if (lines.length < 2) return null;
+  var head = lines[0].split(',').map(function (h) { return h.trim().toLowerCase(); });
+  var need = ['week_start', 'open_share', 'sales', 'food_cogs_max', 'drink_cogs_max', 'wages_max_target', 'wages_max_breakeven', 'overheads', 'profit'];
+  var idx = {};
+  for (var i = 0; i < need.length; i++) { idx[need[i]] = head.indexOf(need[i]); if (idx[need[i]] < 0) return null; }
+  var weeks = [];
+  for (var li = 1; li < lines.length; li++) {
+    var c = lines[li].split(',');
+    var w = { start: (c[idx.week_start] || '').trim(), open: +c[idx.open_share], sales: +c[idx.sales], foodCogs: +c[idx.food_cogs_max], drinkCogs: +c[idx.drink_cogs_max], wagesTarget: +c[idx.wages_max_target], wagesBE: +c[idx.wages_max_breakeven], overheads: +c[idx.overheads], profit: +c[idx.profit] };
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(w.start)) return null;
+    weeks.push(w);
+  }
+  return weeks;
+}
+
+function budgetImportCard(body, existing) {
+  var card = el('div', 'mcard fade-in');
+  card.style.marginTop = '1rem';
+  card.appendChild(el('div', 'm-label', existing ? 'Replace your budget' : 'Add your budget'));
+  card.appendChild(el('div', 'm-def', 'Choose your budget file (PS_budget_import.csv). It is saved on your dashboard, so you only need to do this once, or again if the budget changes.'));
+  var file = document.createElement('input'); file.type = 'file'; file.accept = '.csv,.txt';
+  file.style.marginTop = '0.6rem';
+  var msg = el('div', 'conn-line'); msg.style.marginTop = '0.4rem';
+  file.onchange = function () {
+    var f = file.files && file.files[0]; if (!f) return;
+    var rd = new FileReader();
+    rd.onload = function () {
+      var weeks = parseBudgetCsv(String(rd.result || ''));
+      if (!weeks || !weeks.length) { msg.textContent = 'That file did not look like the budget file. Check it is PS_budget_import.csv.'; return; }
+      msg.textContent = 'Saving ' + weeks.length + ' weeks…';
+      fetch('/api/budget', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ weeks: weeks }) })
+        .then(function (res) { return res.json(); })
+        .then(function (j) { if (j.ok) { msg.textContent = 'Saved ' + j.weeks + ' weeks.'; render(); } else { msg.textContent = 'Could not save that file. Try again.'; } })
+        .catch(function () { msg.textContent = 'Something went wrong. Try again.'; });
+    };
+    rd.readAsText(f);
+  };
+  card.appendChild(file); card.appendChild(msg);
+  body.appendChild(card);
+}
+
+function fmtWeekLabel(startStr) {
+  var d = fromIso(startStr);
+  var months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  return DAY_NAMES[d.getUTCDay()] + ' ' + d.getUTCDate() + ' ' + months[d.getUTCMonth()];
+}
+function money0(v) { return v == null ? '—' : fmtMoney(v, false); }
+
+function renderBudget(root) {
+  root.appendChild(el('div', 'screen-title', 'Budget'));
+  root.appendChild(el('p', 'screen-sub', 'Extra, not one of the core seven. Your weekly budget (pay weeks Tuesday to Monday) tracked against Xero actuals, ex-GST, and the wages you type in each day from Urhere.'));
+  var body = el('div'); body.appendChild(el('div', 'm-def', 'Loading…')); root.appendChild(body);
+  fetch('/api/budget').then(function (r) { return r.json(); }).then(function (j) {
+    body.innerHTML = '';
+    BUDGET.data = j.budget;
+    if (!j.budget || !j.budget.weeks || !j.budget.weeks.length) { budgetImportCard(body, false); return; }
+    paintBudget(body, j.budget.weeks);
+  }).catch(function () { body.textContent = 'Could not load the budget just now.'; });
+}
+
+function wagesEntryCard(body, onSaved) {
+  var card = el('div', 'mcard fade-in');
+  card.style.marginTop = '1rem';
+  card.appendChild(el('div', 'm-label', 'Daily wages · typed in from Urhere'));
+  card.appendChild(el('div', 'm-def', 'Enter the day’s wages plus super, on the same basis as your budget. Pick any date to add or correct a day.'));
+  var form = el('div', 'conn-actions'); form.style.cssText = 'margin-top:0.6rem;flex-wrap:wrap;align-items:flex-end;';
+  var dateIn = document.createElement('input'); dateIn.type = 'date'; dateIn.value = iso(tradingToday());
+  var amt = document.createElement('input'); amt.type = 'number'; amt.min = '0'; amt.step = 'any'; amt.placeholder = 'Wages + super';
+  amt.style.cssText = 'font-family:DM Sans,sans-serif;font-size:13px;padding:7px 10px;border:1px solid var(--border-med);border-radius:8px;width:130px;';
+  var btn = el('button', 'btn-small', 'Save wages for that day');
+  var msg = el('div', 'conn-line'); msg.style.marginTop = '0.4rem';
+  btn.onclick = function () {
+    var v = parseFloat(amt.value);
+    if (!dateIn.value || !isFinite(v) || v < 0) { msg.textContent = 'Enter a date and an amount of 0 or more.'; return; }
+    btn.disabled = true; msg.textContent = 'Saving…';
+    fetch('/api/wages', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ date: dateIn.value, wages: v }) })
+      .then(function (res) { return res.json(); })
+      .then(function (j) { btn.disabled = false; if (j.ok) { msg.textContent = 'Saved for ' + dateIn.value + '.'; amt.value = ''; onSaved(); } else { msg.textContent = 'Could not save that. Try again.'; } })
+      .catch(function () { btn.disabled = false; msg.textContent = 'Something went wrong. Try again.'; });
+  };
+  form.appendChild(dateIn); form.appendChild(amt); form.appendChild(btn);
+  card.appendChild(form); card.appendChild(msg);
+  body.appendChild(card);
+  return { dateIn: dateIn, amt: amt, msg: msg, form: form };
+}
+
+function paintBudget(body, weeks) {
+  var today = iso(tradingToday());
+  var cur = null;
+  weeks.forEach(function (w) { if (w.start <= today) cur = w; });
+
+  /* ---- this week ---- */
+  var wk = el('div', 'mcard fade-in'); wk.style.marginTop = '1rem';
+  body.appendChild(wk);
+  var entry = wagesEntryCard(body, function () { render(); });
+
+  if (!cur) {
+    wk.appendChild(el('div', 'm-label', 'This week'));
+    wk.appendChild(el('div', 'm-def', 'Your budget starts on ' + fmtWeekLabel(weeks[0].start) + '. Nothing to track yet.'));
+  } else {
+    var end = iso(addDays(fromIso(cur.start), 6));
+    wk.appendChild(el('div', 'm-label', 'This week · ' + fmtWeekLabel(cur.start) + ' to ' + fmtWeekLabel(end) + ' (pay week)'));
+    var box = el('div', 'm-def', 'Loading…'); wk.appendChild(box);
+    var wurl = '/api/budget/week?start=' + cur.start + '&pace=1&tz=' + encodeURIComponent(SETTINGS.timezone);
+    Promise.all([
+      fetch(wurl).then(function (r) { return r.json(); }),
+      fetch('/api/extras/wages-daily?from=' + cur.start + '&to=' + end).then(function (r) { return r.json(); })
+    ]).then(function (both) {
+      var a = both[0], wd = both[1].days || [];
+      box.innerHTML = '';
+      if (a.error) { box.textContent = a.error; return; }
+      if (a.configured === false) { box.textContent = 'Not configured — connect Xero first.'; return; }
+      var typed = 0, nTyped = 0;
+      wd.forEach(function (x) { if (typeof x.wages === 'number') { typed += x.wages; nTyped++; } });
+      function line(label, actual, ref, refLabel, goodWhenUnder) {
+        var r = el('div', 'conn-line');
+        var txt = label + ': ' + money0(actual) + (ref != null ? ' · ' + refLabel + ' ' + money0(ref) : '');
+        if (actual != null && ref != null) {
+          var bad = goodWhenUnder ? actual > ref : actual < ref;
+          r.style.color = bad ? 'var(--c-coral)' : 'var(--c-green)';
+        }
+        r.textContent = txt; box.appendChild(r);
+      }
+      var through = a.through ? ' (to ' + fmtWeekLabel(a.through) + ')' : '';
+      var pace = (a.paceShare != null) ? cur.sales * a.paceShare : null;
+      if (a.sales) {
+        var foodDrink = a.sales.food + a.sales.drink;
+        line('Sales so far' + through, foodDrink, pace != null ? pace : cur.sales, pace != null ? 'on pace for' : 'week budget', false);
+        if (pace != null) { var note = el('div', 'm-def', 'Week budget ' + money0(cur.sales) + '. “On pace” uses how last year’s same weekdays built up.'); note.style.margin = '0 0 0.4rem'; box.appendChild(note); }
+        line('Food cost so far', a.cogs.food, cur.foodCogs, 'max for the week', true);
+        line('Drink cost so far', a.cogs.drink, cur.drinkCogs, 'max for the week', true);
+        line('Overheads so far', a.overheads, cur.overheads, 'budget', true);
+      } else {
+        box.appendChild(el('div', 'conn-line', 'No Xero figures yet for this week (they show once yesterday’s sales have posted).'));
+      }
+      if (nTyped) {
+        line('Wages typed in (' + nTyped + ' day' + (nTyped === 1 ? '' : 's') + ')', typed, cur.wagesTarget, 'max for the week', true);
+        var left = cur.wagesTarget - typed;
+        var lr = el('div', 'conn-line'); lr.style.fontWeight = '600'; lr.style.color = left >= 0 ? 'var(--c-green)' : 'var(--c-coral)';
+        lr.textContent = left >= 0 ? 'Wages left to spend this week: ' + money0(left) : 'Over the wage max by ' + money0(-left);
+        box.appendChild(lr);
+      } else {
+        box.appendChild(el('div', 'conn-line', 'No wages typed in yet this week. Wage max for the week: ' + money0(cur.wagesTarget) + ' (' + money0(cur.wagesBE) + ' to break even).'));
+      }
+      var list = el('div', 'm-def'); list.style.marginTop = '0.6rem';
+      list.appendChild(el('div', 'conn-line', 'Days this week (click a date to add or edit wages)'));
+      wd.forEach(function (x) {
+        var d = el('div', 'conn-line');
+        var link = document.createElement('span');
+        link.textContent = fmtWeekLabel(x.date);
+        link.style.cssText = 'cursor:pointer;text-decoration:underline;color:var(--accent);';
+        link.onclick = function () { entry.dateIn.value = x.date; entry.amt.value = (typeof x.wages === 'number') ? x.wages : ''; entry.msg.textContent = 'Editing ' + x.date + ' — change the amount and press save.'; entry.form.scrollIntoView({ behavior: 'smooth', block: 'center' }); entry.amt.focus(); };
+        d.appendChild(link);
+        d.appendChild(document.createTextNode(' — ' + (typeof x.wages === 'number' ? money0(x.wages) : 'not entered')));
+        list.appendChild(d);
+      });
+      box.appendChild(list);
+    }).catch(function () { box.textContent = 'Could not load this week just now.'; });
+  }
+
+  /* ---- week by week ---- */
+  var card = el('div', 'mcard fade-in'); card.style.marginTop = '1rem';
+  card.appendChild(el('div', 'm-label', 'Week by week · actual against budget'));
+  card.appendChild(el('div', 'm-def', 'Sales are food and drink only, as in your budget. Wages show what you typed in; if a week has none, the Xero pay run processed the following Tuesday is used. Profit also counts other trading income and leaves out director drawings.'));
+  var scroll = document.createElement('div');
+  scroll.style.cssText = 'max-height:460px;overflow:auto;border:1px solid var(--border-med);border-radius:8px;margin-top:0.6rem;';
+  var table = document.createElement('table'); table.style.cssText = 'width:100%;border-collapse:collapse;font-size:12.5px;';
+  var cols = ['Week (Tue)', 'Sales', 'Food cost', 'Drink cost', 'Wages', 'Overheads', 'Profit', ''];
+  table.innerHTML = '<thead><tr>' + cols.map(function (c, i) { return '<th style="text-align:' + (i === 0 ? 'left' : 'right') + ';padding:6px 8px;color:var(--text-dim);font-weight:600;position:sticky;top:0;background:var(--bg-card);">' + c + '</th>'; }).join('') + '</tr></thead><tbody></tbody>';
+  var tb = table.querySelector('tbody');
+  var shown = weeks.filter(function (w) { return w.start <= today; });
+  var nextWk = weeks.filter(function (w) { return w.start > today; }).slice(0, 3);
+  var rowsToShow = shown.concat(nextWk);
+  var queue = [];
+  rowsToShow.forEach(function (w) {
+    var tr = document.createElement('tr'); tr.style.cssText = 'border-top:1px solid var(--border-med);';
+    var cells = [];
+    for (var i = 0; i < 8; i++) { var td = document.createElement('td'); td.style.cssText = 'padding:5px 8px;text-align:' + (i === 0 ? 'left' : 'right') + ';white-space:nowrap;'; tr.appendChild(td); cells.push(td); }
+    cells[0].textContent = fmtWeekLabel(w.start) + (w.open !== 1 ? ' (' + w.open + 'x)' : '');
+    cells[1].innerHTML = '<span style="color:var(--text-dim)">budget</span> ' + money0(w.sales);
+    cells[2].innerHTML = '<span style="color:var(--text-dim)">max</span> ' + money0(w.foodCogs);
+    cells[3].innerHTML = '<span style="color:var(--text-dim)">max</span> ' + money0(w.drinkCogs);
+    cells[4].innerHTML = '<span style="color:var(--text-dim)">max</span> ' + money0(w.wagesTarget);
+    cells[5].innerHTML = '<span style="color:var(--text-dim)">budget</span> ' + money0(w.overheads);
+    cells[6].innerHTML = '<span style="color:var(--text-dim)">budget</span> ' + money0(w.profit);
+    tb.appendChild(tr);
+    if (w.start <= today) queue.push({ w: w, cells: cells });
+  });
+  scroll.appendChild(table); card.appendChild(scroll); body.appendChild(card);
+
+  function fill(item, a, wagesDays) {
+    var w = item.w, c = item.cells;
+    if (!a || a.error || !a.sales) { c[7].textContent = a && a.error ? '!' : 'no data yet'; c[7].style.color = 'var(--text-dim)'; return; }
+    function two(cell, act, ref, under) {
+      var bad = under ? act > ref : act < ref;
+      cell.innerHTML = '<b style="color:' + (bad ? 'var(--c-coral)' : 'var(--c-green)') + '">' + money0(act) + '</b> <span style="color:var(--text-dim)">/ ' + money0(ref) + '</span>';
+    }
+    var fd = a.sales.food + a.sales.drink;
+    two(c[1], fd, w.sales, false);
+    two(c[2], a.cogs.food, w.foodCogs, true);
+    two(c[3], a.cogs.drink, w.drinkCogs, true);
+    two(c[5], a.overheads, w.overheads, true);
+    var typed = 0, n = 0; (wagesDays || []).forEach(function (x) { if (typeof x.wages === 'number') { typed += x.wages; n++; } });
+    var wages = null, src = '';
+    if (n) { wages = typed; src = ' <span style="color:var(--text-dim)">(typed ' + n + '/7)</span>'; }
+    else if (a.payRun != null) { wages = a.payRun; src = ' <span style="color:var(--text-dim)">(Xero)</span>'; }
+    if (wages != null) { var bw = wages > w.wagesTarget; c[4].innerHTML = '<b style="color:' + (bw ? 'var(--c-coral)' : 'var(--c-green)') + '">' + money0(wages) + '</b> <span style="color:var(--text-dim)">/ ' + money0(w.wagesTarget) + '</span>' + src; }
+    else { c[4].innerHTML = '<span style="color:var(--text-dim)">pay run due ' + fmtWeekLabel(a.payDay) + '</span>'; }
+    var complete = a.closed && wages != null && (n === 7 || n === 0);
+    if (complete) {
+      var profit = a.sales.total - a.cogs.food - a.cogs.drink - a.cogs.other - wages - a.overheads;
+      var ok = profit >= 0;
+      c[6].innerHTML = '<b style="color:' + (ok ? 'var(--c-green)' : 'var(--c-coral)') + '">' + money0(profit) + '</b> <span style="color:var(--text-dim)">/ ' + money0(w.profit) + '</span>';
+      c[7].textContent = ok ? 'in the black' : 'loss'; c[7].style.color = ok ? 'var(--c-green)' : 'var(--c-coral)';
+    } else {
+      c[6].innerHTML = '<span style="color:var(--text-dim)">week in progress</span>';
+      c[7].textContent = '';
+    }
+  }
+  /* one week at a time so Xero's per-minute limit is never hit */
+  (function next(i) {
+    if (i >= queue.length) return;
+    var item = queue[i];
+    Promise.all([
+      fetch('/api/budget/week?start=' + item.w.start + '&tz=' + encodeURIComponent(SETTINGS.timezone)).then(function (r) { return r.json(); }),
+      fetch('/api/extras/wages-daily?from=' + item.w.start + '&to=' + iso(addDays(fromIso(item.w.start), 6))).then(function (r) { return r.json(); })
+    ]).then(function (both) { fill(item, both[0], both[1].days); }).catch(function () { fill(item, { error: true }, []); }).then(function () { next(i + 1); });
+  })(0);
+
+  budgetImportCard(body, true);
 }
 
 function renderSettings(root) {

@@ -1039,6 +1039,167 @@ async function apiDaily(env, url) {
   return json({ accounting: accOn, pos: posOn, days });
 }
 
+/* ---------------- Budget tracker (extra, not one of the core seven) --------
+   The owner's weekly budget (pay weeks Tue-Mon) is stored in KV (never in the
+   repo - it is business data and the repo is public). Actuals: every money
+   figure comes from Xero, ex-GST, split the way the owner's chart of accounts
+   is laid out (Food Sales / Beverage Sales, Food COGS / Beverages COGS).
+   Wages come from the daily figures the owner types in from Urhere (Urhere has
+   no usable API); until a week has any typed days, the Xero pay run for that
+   week (processed the following Tuesday) is shown instead. */
+function addDaysStr(s, n) {
+  const d = new Date(s + 'T12:00:00Z');
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+/* Walks a Xero P&L report and splits it the way the budget is built. */
+function xeroBudgetFigures(report) {
+  const top = (report && report.Reports && report.Reports[0] && report.Reports[0].Rows) || [];
+  const out = { foodSales: 0, drinkSales: 0, otherSales: 0, foodCogs: 0, drinkCogs: 0, otherCogs: 0, wages: 0, overheads: 0, drawings: 0 };
+  function walk(rows, path, kind) {
+    for (const r of rows || []) {
+      if (!r) continue;
+      if (r.RowType === 'Section') {
+        const k = kind || xeroSectionKind(r.Title);
+        walk(r.Rows, kind ? path.concat([String(r.Title || '').toLowerCase()]) : path, k);
+      } else if (r.RowType === 'Row' && kind) {
+        const cells = r.Cells || [];
+        const name = String((cells[0] && cells[0].Value) || '');
+        const amt = parseFloat(cells[1] && cells[1].Value);
+        if (!isFinite(amt)) continue;
+        const p = path.join('|');
+        if (kind === 'income') {
+          if (/food sales/.test(p)) out.foodSales += amt;
+          else if (/beverage sales/.test(p)) out.drinkSales += amt;
+          else out.otherSales += amt;
+        } else if (kind === 'cos') {
+          if (/beverage/.test(p)) out.drinkCogs += amt;
+          else if (/food/.test(p)) out.foodCogs += amt;
+          else out.otherCogs += amt;
+        } else if (kind === 'opex') {
+          if (XERO_WAGE_RE.test(name)) out.wages += amt;
+          else if (/drawing/i.test(name)) out.drawings += amt;
+          else out.overheads += amt;
+        }
+      }
+    }
+  }
+  walk(top, [], null);
+  return out;
+}
+
+async function readIngestedDailyField(env, source, field, from, to) {
+  const dates = eachDate(from, to);
+  return Promise.all(dates.map(async (date) => {
+    const raw = await env.TOKENS.get('data:' + source + ':' + date);
+    let value = null;
+    if (raw) {
+      try { const p = JSON.parse(raw); if (typeof p[field] === 'number' && isFinite(p[field])) value = p[field]; } catch (e) { /* skip */ }
+    }
+    return { date, value };
+  }));
+}
+
+/* POST /api/wages {date, wages} - the day's wages (plus super), typed in from Urhere */
+async function apiWages(env, request) {
+  let body; try { body = await request.json(); } catch (e) { return json({ ok: false }, 400); }
+  const date = String((body && body.date) || '');
+  const wages = Number(body && body.wages);
+  if (!DATE_RE.test(date) || !isFinite(wages) || wages < 0) return json({ ok: false, error: 'bad input' }, 400);
+  await saveIngestedRows(env, 'wages', [{ date, wages }]);
+  return json({ ok: true });
+}
+/* GET /api/extras/wages-daily?from=&to= */
+async function apiWagesDaily(env, url) {
+  const from = url.searchParams.get('from'), to = url.searchParams.get('to');
+  if (!DATE_RE.test(from || '') || !DATE_RE.test(to || '')) return json({ error: 'bad range' }, 400);
+  const days = await readIngestedDailyField(env, 'wages', 'wages', from, to);
+  return json({ days: days.map((d) => ({ date: d.date, wages: d.value })) });
+}
+
+async function apiBudgetGet(env) {
+  const raw = await env.TOKENS.get('budget:v1');
+  let budget = null;
+  if (raw) { try { budget = JSON.parse(raw); } catch (e) { budget = null; } }
+  return json({ budget });
+}
+async function apiBudgetSave(env, request) {
+  let body; try { body = await request.json(); } catch (e) { return json({ ok: false }, 400); }
+  const weeks = body && body.weeks;
+  if (!Array.isArray(weeks) || weeks.length < 1 || weeks.length > 120) return json({ ok: false, error: 'bad weeks' }, 400);
+  const clean = [];
+  for (const w of weeks) {
+    if (!w || !DATE_RE.test(String(w.start || ''))) return json({ ok: false, error: 'bad week start' }, 400);
+    const row = { start: w.start };
+    for (const k of ['open', 'sales', 'foodCogs', 'drinkCogs', 'wagesTarget', 'wagesBE', 'overheads', 'profit']) {
+      const n = Number(w[k]);
+      if (!isFinite(n)) return json({ ok: false, error: 'bad number in ' + k }, 400);
+      row[k] = Math.round(n * 100) / 100;
+    }
+    clean.push(row);
+  }
+  clean.sort((a, b) => (a.start < b.start ? -1 : 1));
+  await env.TOKENS.put('budget:v1', JSON.stringify({ weeks: clean, savedAt: new Date().toISOString() }));
+  return json({ ok: true, weeks: clean.length });
+}
+
+/* GET /api/budget/week?start=YYYY-MM-DD&tz=&pace=1 - Xero actuals for one
+   pay week (Tue-Mon). Closed weeks are cached; the current week is live. */
+async function apiBudgetWeek(env, url) {
+  const start = url.searchParams.get('start');
+  if (!DATE_RE.test(start || '')) return json({ error: 'bad start' }, 400);
+  if (!ADAPTERS.accounting.configured) return json({ configured: false });
+  const tz = url.searchParams.get('tz') || 'Australia/Sydney';
+  const wantPace = url.searchParams.get('pace') === '1';
+  const todayStr = tradingDateInTz(new Date().toISOString(), tz, 0);
+  const endDay = addDaysStr(start, 6);
+  const payDay = addDaysStr(start, 7);
+  const closed = endDay < todayStr;
+  const cacheKey = 'budgetwk:' + start;
+  if (closed && !wantPace) {
+    const cached = await env.TOKENS.get(cacheKey);
+    if (cached) { try { return json(JSON.parse(cached)); } catch (e) { /* refetch */ } }
+  }
+  try {
+    const h = makeHelpers(env, 'accounting');
+    const tenantId = await xeroTenantId(h);
+    const init = { headers: { 'Xero-Tenant-Id': tenantId, 'Accept': 'application/json' } };
+    const getPL = (from, to) => h.fetchJson('https://api.xero.com/api.xro/2.0/Reports/ProfitAndLoss?fromDate=' + from + '&toDate=' + to, init);
+    const yesterday = addDaysStr(todayStr, -1);
+    const through = closed ? endDay : yesterday;
+    const out = { configured: true, start, through: null, closed, payDay, payRun: null, sales: null, cogs: null, overheads: null, drawings: null, paceShare: null };
+    if (through >= start) {
+      const f = xeroBudgetFigures(await getPL(start, through));
+      out.through = through;
+      out.sales = { food: f.foodSales, drink: f.drinkSales, other: f.otherSales, total: f.foodSales + f.drinkSales + f.otherSales };
+      out.cogs = { food: f.foodCogs, drink: f.drinkCogs, other: f.otherCogs };
+      out.overheads = f.overheads;
+      out.drawings = f.drawings;
+    }
+    if (payDay <= todayStr) {
+      out.payRun = xeroBudgetFigures(await getPL(payDay, payDay)).wages;
+    }
+    if (wantPace && !closed && out.through) {
+      /* where a normal week would be by now: last year's same weekdays */
+      const lyDates = [0, 1, 2, 3, 4, 5, 6].map((i) => addDaysStr(start, i - 364));
+      const ly = await dailyAccountingFigures(env, lyDates, tz);
+      const vals = lyDates.map((d) => (ly[d] && typeof ly[d].revenue === 'number' ? ly[d].revenue : 0));
+      const total = vals.reduce((a, b) => a + b, 0);
+      const elapsed = Math.round((new Date(out.through + 'T12:00:00Z') - new Date(start + 'T12:00:00Z')) / 86400000) + 1;
+      if (total > 0) out.paceShare = vals.slice(0, elapsed).reduce((a, b) => a + b, 0) / total;
+    }
+    if (closed) {
+      const ageDays = Math.round((new Date(todayStr + 'T12:00:00Z') - new Date(payDay + 'T12:00:00Z')) / 86400000);
+      try { await env.TOKENS.put(cacheKey, JSON.stringify(out), { expirationTtl: ageDays >= 14 ? 2592000 : 10800 }); } catch (e) { /* ignore */ }
+    }
+    return json(out);
+  } catch (err) {
+    return json({ configured: true, error: plainError(err.status || 500) }, 200);
+  }
+}
+
 /* ---------------- Square extras: daypart split + top/bottom sellers ------
    Both extras, added at the owner's request - NOT part of kpi-spec.md's
    locked six/seven. Quantity and transaction-count only, never a dollar
@@ -1354,6 +1515,26 @@ export default {
     if (path === '/api/extras/daily' && request.method === 'GET') {
       if (!loggedIn) return json({ error: 'auth' }, 401);
       return apiDaily(env, url);
+    }
+    if (path === '/api/wages' && request.method === 'POST') {
+      if (!loggedIn) return json({ error: 'auth' }, 401);
+      return apiWages(env, request);
+    }
+    if (path === '/api/extras/wages-daily' && request.method === 'GET') {
+      if (!loggedIn) return json({ error: 'auth' }, 401);
+      return apiWagesDaily(env, url);
+    }
+    if (path === '/api/budget' && request.method === 'GET') {
+      if (!loggedIn) return json({ error: 'auth' }, 401);
+      return apiBudgetGet(env);
+    }
+    if (path === '/api/budget' && request.method === 'POST') {
+      if (!loggedIn) return json({ error: 'auth' }, 401);
+      return apiBudgetSave(env, request);
+    }
+    if (path === '/api/budget/week' && request.method === 'GET') {
+      if (!loggedIn) return json({ error: 'auth' }, 401);
+      return apiBudgetWeek(env, url);
     }
     const authRoute = /^\/auth\/(accounting|pos|rostering)\/(start|callback)$/.exec(path);
     if (authRoute && request.method === 'GET') {
