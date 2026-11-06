@@ -2490,6 +2490,7 @@ function paintBudget(body, weeks) {
         line('Food cost so far', a.cogs.food, cur.foodCogs, 'max for the week', true);
         line('Drink cost so far', a.cogs.drink, cur.drinkCogs, 'max for the week', true);
         line('Overheads so far', a.overheads, cur.overheads, 'budget', true);
+        if (a.cogs.other > 0) box.appendChild(el('div', 'conn-line', 'Other cost of sales (not matched to food or drink): ' + money0(a.cogs.other)));
       } else {
         box.appendChild(el('div', 'conn-line', 'No Xero figures yet for this week (they show once yesterday’s sales have posted).'));
       }

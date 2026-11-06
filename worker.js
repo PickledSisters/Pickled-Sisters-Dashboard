@@ -1073,10 +1073,14 @@ function xeroBudgetFigures(report) {
         if (kind === 'income') {
           if (/food sales/.test(p)) out.foodSales += amt;
           else if (/beverage sales/.test(p)) out.drinkSales += amt;
+          else if (/wine|beer|alcohol|drinks|beverage|coffee|tea\b/i.test(name)) out.drinkSales += amt;
+          else if (/catering|food|larder|takeaway|events/i.test(name)) out.foodSales += amt;
           else out.otherSales += amt;
         } else if (kind === 'cos') {
           if (/beverage/.test(p)) out.drinkCogs += amt;
           else if (/food/.test(p)) out.foodCogs += amt;
+          else if (/wine|beer|spirit|coffee|\btea\b|milk|beverage/i.test(name)) out.drinkCogs += amt;
+          else if (/dairy|egg|fruit|veg|meat|poultry|seafood|food|consumable|bread|bakery|grocer/i.test(name)) out.foodCogs += amt;
           else out.otherCogs += amt;
         } else if (kind === 'opex') {
           if (XERO_WAGE_RE.test(name)) out.wages += amt;
@@ -1157,7 +1161,7 @@ async function apiBudgetWeek(env, url) {
   const endDay = addDaysStr(start, 6);
   const payDay = addDaysStr(start, 7);
   const closed = endDay < todayStr;
-  const cacheKey = 'budgetwk:' + start;
+  const cacheKey = 'budgetwk2:' + start;
   if (closed && !wantPace) {
     const cached = await env.TOKENS.get(cacheKey);
     if (cached) { try { return json(JSON.parse(cached)); } catch (e) { /* refetch */ } }
