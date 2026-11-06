@@ -2503,6 +2503,15 @@ function paintBudget(body, weeks) {
       } else {
         box.appendChild(el('div', 'conn-line', 'No wages typed in yet this week. Wage max for the week: ' + money0(cur.wagesTarget) + ' (' + money0(cur.wagesBE) + ' to break even).'));
       }
+      if (a.sales) {
+        var costsSoFar = a.cogs.food + a.cogs.drink + a.cogs.other + a.overheads;
+        var profitSoFar = a.sales.total - costsSoFar - (nTyped ? typed : 0);
+        var pr = el('div', 'conn-line'); pr.style.cssText = 'font-weight:600;margin-top:0.4rem;color:' + (profitSoFar >= 0 ? 'var(--c-green)' : 'var(--c-coral)');
+        pr.textContent = 'Profit so far' + through + ': ' + money0(profitSoFar) + (nTyped ? '' : ' (before wages, none typed in yet)');
+        box.appendChild(pr);
+        var pn = el('div', 'm-def', 'Sales and costs to date, less the wages you have typed in. It is a running position, not a forecast: bills not yet entered in Xero, the rest of the week’s sales and unpaid overheads will move it. Weekly budget profit: ' + money0(cur.profit) + '.');
+        pn.style.margin = '0 0 0.4rem'; box.appendChild(pn);
+      }
       var list = el('div', 'm-def'); list.style.marginTop = '0.6rem';
       list.appendChild(el('div', 'conn-line', 'Days this week (click a date to add or edit wages)'));
       wd.forEach(function (x) {
@@ -2574,8 +2583,10 @@ function paintBudget(body, weeks) {
       c[6].innerHTML = '<b style="color:' + (ok ? 'var(--c-green)' : 'var(--c-coral)') + '">' + money0(profit) + '</b> <span style="color:var(--text-dim)">/ ' + money0(w.profit) + '</span>';
       c[7].textContent = ok ? 'in the black' : 'loss'; c[7].style.color = ok ? 'var(--c-green)' : 'var(--c-coral)';
     } else {
-      c[6].innerHTML = '<span style="color:var(--text-dim)">week in progress</span>';
-      c[7].textContent = '';
+      var wSoFar = n ? typed : 0;
+      var pSo = a.sales.total - a.cogs.food - a.cogs.drink - a.cogs.other - a.overheads - wSoFar;
+      c[6].innerHTML = '<b style="color:' + (pSo >= 0 ? 'var(--c-green)' : 'var(--c-coral)') + '">' + money0(pSo) + '</b> <span style="color:var(--text-dim)">/ ' + money0(w.profit) + '</span>';
+      c[7].textContent = 'so far' + (n ? '' : ', before wages'); c[7].style.color = 'var(--text-dim)';
     }
   }
   /* one week at a time so Xero's per-minute limit is never hit */
