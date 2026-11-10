@@ -1079,7 +1079,7 @@ function dailyTakingsCard(r) {
     scrollBox.style.cssText = 'max-height:340px;overflow-y:auto;border:1px solid var(--border-med);border-radius:8px;';
     var table = document.createElement('table');
     table.style.cssText = 'width:100%;border-collapse:collapse;font-size:13px;';
-    var cols = ['Day', 'Net sales', 'Budget', 'Variance', 'Same day LY', 'vs LY', 'Trans', 'Trans LY', 'Avg spend', 'Wages', 'Wage %'];
+    var cols = ['Day', 'Net sales', 'Budget', 'Variance', 'Same day LY', 'vs LY', 'Trans', 'Trans LY', 'Avg spend', 'Wages + super', 'Wage %'];
     table.innerHTML = '<thead><tr>' + cols.map(function (c, i) {
       return '<th style="text-align:' + (i === 0 ? 'left' : 'right') + ';padding:6px 8px;color:var(--text-dim);font-weight:600;position:sticky;top:0;background:var(--bg-card);">' + c + '</th>';
     }).join('') + '</tr></thead><tbody></tbody>';
@@ -1114,7 +1114,7 @@ function dailyTakingsCard(r) {
       td(tx == null ? '—' : tx);
       td(lyTx == null ? '—' : lyTx, 'color:var(--text-dim);');
       td(avgSpend == null ? '—' : fmtMoney(avgSpend, false));
-      var wv = (typeof wmap[d.date] === 'number') ? wmap[d.date] : null;
+      var wv = (typeof wmap[d.date] === 'number') ? withSuper(wmap[d.date]) : null;
       var wp = (wv != null && rev != null && rev > 0) ? (wv / rev * 100) : null;
       if (wv != null && rev != null && rev > 0) { totWages += wv; totRevW += rev; }
       td(wv == null ? '—' : fmtMoney(wv, false));
@@ -2405,6 +2405,9 @@ function fmtWeekLabel(startStr) {
   return DAY_NAMES[d.getUTCDay()] + ' ' + d.getUTCDate() + ' ' + months[d.getUTCMonth()];
 }
 function money0(v) { return v == null ? '—' : fmtMoney(v, false); }
+/* Urhere wages exclude super; the budget includes it, so 12% (the super guarantee) is added at this end. */
+var SUPER_RATE = 0.12;
+function withSuper(v) { return v * (1 + SUPER_RATE); }
 
 function renderBudget(root) {
   root.appendChild(el('div', 'screen-title', 'Budget'));
@@ -2421,11 +2424,11 @@ function renderBudget(root) {
 function wagesEntryCard(body, onSaved) {
   var card = el('div', 'mcard fade-in');
   card.style.marginTop = '1rem';
-  card.appendChild(el('div', 'm-label', 'Daily wages · typed in from Urhere'));
-  card.appendChild(el('div', 'm-def', 'Enter the day’s wages plus super, on the same basis as your budget. Pick any date to add or correct a day.'));
+  card.appendChild(el('div', 'm-label', 'Daily wages · from Urhere'));
+  card.appendChild(el('div', 'm-def', 'Enter the day’s wages exactly as Urhere shows them (before super). The dashboard adds 12% super for you, to match your budget. Pick any date to add or correct a day.'));
   var form = el('div', 'conn-actions'); form.style.cssText = 'margin-top:0.6rem;flex-wrap:wrap;align-items:flex-end;';
   var dateIn = document.createElement('input'); dateIn.type = 'date'; dateIn.value = iso(tradingToday());
-  var amt = document.createElement('input'); amt.type = 'number'; amt.min = '0'; amt.step = 'any'; amt.placeholder = 'Wages + super';
+  var amt = document.createElement('input'); amt.type = 'number'; amt.min = '0'; amt.step = 'any'; amt.placeholder = 'Wages from Urhere';
   amt.style.cssText = 'font-family:DM Sans,sans-serif;font-size:13px;padding:7px 10px;border:1px solid var(--border-med);border-radius:8px;width:130px;';
   var btn = el('button', 'btn-small', 'Save wages for that day');
   var msg = el('div', 'conn-line'); msg.style.marginTop = '0.4rem';
@@ -2440,6 +2443,28 @@ function wagesEntryCard(body, onSaved) {
   };
   form.appendChild(dateIn); form.appendChild(amt); form.appendChild(btn);
   card.appendChild(form); card.appendChild(msg);
+  var bulkLbl = el('div', 'm-def', 'Or paste a whole week, one day per line, like 2026-11-10 1250.50');
+  bulkLbl.style.marginTop = '0.8rem';
+  var bulk = document.createElement('textarea'); bulk.rows = 4; bulk.placeholder = '2026-11-10 1250.50';
+  bulk.style.cssText = 'width:100%;max-width:340px;font-family:DM Sans,sans-serif;font-size:13px;padding:7px 10px;border:1px solid var(--border-med);border-radius:8px;display:block;';
+  var bulkBtn = el('button', 'btn-small', 'Save pasted days'); bulkBtn.style.marginTop = '0.4rem';
+  var bulkMsg = el('div', 'conn-line'); bulkMsg.style.marginTop = '0.4rem';
+  bulkBtn.onclick = function () {
+    var items = [];
+    bulk.value.split('\n').forEach(function (ln) {
+      var m = /(\d{4}-\d{2}-\d{2})[\s,;:=]+\$?\s*([\d,]+(?:\.\d+)?)/.exec(ln);
+      if (m) items.push({ date: m[1], wages: parseFloat(m[2].replace(/,/g, '')) });
+    });
+    if (!items.length) { bulkMsg.textContent = 'I could not find any lines like 2026-11-10 1250.50.'; return; }
+    bulkBtn.disabled = true; bulkMsg.textContent = 'Saving ' + items.length + ' days…';
+    var done = 0;
+    (function next(i) {
+      if (i >= items.length) { bulkBtn.disabled = false; bulkMsg.textContent = 'Saved ' + done + ' of ' + items.length + ' days.'; bulk.value = ''; onSaved(); return; }
+      fetch('/api/wages', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(items[i]) })
+        .then(function (res) { return res.json(); }).then(function (j) { if (j.ok) done++; }).catch(function () {}).then(function () { next(i + 1); });
+    })(0);
+  };
+  card.appendChild(bulkLbl); card.appendChild(bulk); card.appendChild(bulkBtn); card.appendChild(bulkMsg);
   body.appendChild(card);
   return { dateIn: dateIn, amt: amt, msg: msg, form: form };
 }
@@ -2471,7 +2496,7 @@ function paintBudget(body, weeks) {
       if (a.error) { box.textContent = a.error; return; }
       if (a.configured === false) { box.textContent = 'Not configured — connect Xero first.'; return; }
       var typed = 0, nTyped = 0;
-      wd.forEach(function (x) { if (typeof x.wages === 'number') { typed += x.wages; nTyped++; } });
+      wd.forEach(function (x) { if (typeof x.wages === 'number') { typed += withSuper(x.wages); nTyped++; } });
       function line(label, actual, ref, refLabel, goodWhenUnder) {
         var r = el('div', 'conn-line');
         var txt = label + ': ' + money0(actual) + (ref != null ? ' · ' + refLabel + ' ' + money0(ref) : '');
@@ -2521,7 +2546,7 @@ function paintBudget(body, weeks) {
         link.style.cssText = 'cursor:pointer;text-decoration:underline;color:var(--accent);';
         link.onclick = function () { entry.dateIn.value = x.date; entry.amt.value = (typeof x.wages === 'number') ? x.wages : ''; entry.msg.textContent = 'Editing ' + x.date + ' — change the amount and press save.'; entry.form.scrollIntoView({ behavior: 'smooth', block: 'center' }); entry.amt.focus(); };
         d.appendChild(link);
-        d.appendChild(document.createTextNode(' — ' + (typeof x.wages === 'number' ? money0(x.wages) : 'not entered')));
+        d.appendChild(document.createTextNode(' — ' + (typeof x.wages === 'number' ? money0(x.wages) + ' + super = ' + money0(withSuper(x.wages)) : 'not entered')));
         list.appendChild(d);
       });
       box.appendChild(list);
@@ -2570,7 +2595,7 @@ function paintBudget(body, weeks) {
     two(c[2], a.cogs.food, w.foodCogs, true);
     two(c[3], a.cogs.drink, w.drinkCogs, true);
     two(c[5], a.overheads, w.overheads, true);
-    var typed = 0, n = 0; (wagesDays || []).forEach(function (x) { if (typeof x.wages === 'number') { typed += x.wages; n++; } });
+    var typed = 0, n = 0; (wagesDays || []).forEach(function (x) { if (typeof x.wages === 'number') { typed += withSuper(x.wages); n++; } });
     var wages = null, src = '';
     if (n) { wages = typed; src = ' <span style="color:var(--text-dim)">(typed ' + n + '/7)</span>'; }
     else if (a.payRun != null) { wages = a.payRun; src = ' <span style="color:var(--text-dim)">(Xero)</span>'; }
