@@ -2556,7 +2556,7 @@ function paintBudget(body, weeks) {
   /* ---- week by week ---- */
   var card = el('div', 'mcard fade-in'); card.style.marginTop = '1rem';
   card.appendChild(el('div', 'm-label', 'Week by week · actual against budget'));
-  card.appendChild(el('div', 'm-def', 'Sales are food and drink only, as in your budget. Wages show what you typed in; if a week has none, the Xero pay run processed the following Tuesday is used. Profit also counts other trading income and leaves out director drawings.'));
+  card.appendChild(el('div', 'm-def', 'Sales are food and drink only, as in your budget. Wages use the days you typed in from Urhere (plus 12% super) while a week is running; once the Xero pay run is processed the following Tuesday, the Xero figure replaces them. Profit also counts other trading income and leaves out director drawings.'));
   var scroll = document.createElement('div');
   scroll.style.cssText = 'max-height:460px;overflow:auto;border:1px solid var(--border-med);border-radius:8px;margin-top:0.6rem;';
   var table = document.createElement('table'); table.style.cssText = 'width:100%;border-collapse:collapse;font-size:12.5px;';
@@ -2597,11 +2597,12 @@ function paintBudget(body, weeks) {
     two(c[5], a.overheads, w.overheads, true);
     var typed = 0, n = 0; (wagesDays || []).forEach(function (x) { if (typeof x.wages === 'number') { typed += withSuper(x.wages); n++; } });
     var wages = null, src = '';
-    if (n) { wages = typed; src = ' <span style="color:var(--text-dim)">(typed ' + n + '/7)</span>'; }
-    else if (a.payRun != null) { wages = a.payRun; src = ' <span style="color:var(--text-dim)">(Xero)</span>'; }
+    if (a.payRun != null && a.payRun > 0) { wages = a.payRun; src = ' <span style="color:var(--text-dim)">(Xero payroll)</span>'; }
+    else if (n) { wages = typed; src = ' <span style="color:var(--text-dim)">(Urhere + super, ' + n + '/7 days)</span>'; }
     if (wages != null) { var bw = wages > w.wagesTarget; c[4].innerHTML = '<b style="color:' + (bw ? 'var(--c-coral)' : 'var(--c-green)') + '">' + money0(wages) + '</b> <span style="color:var(--text-dim)">/ ' + money0(w.wagesTarget) + '</span>' + src; }
     else { c[4].innerHTML = '<span style="color:var(--text-dim)">pay run due ' + fmtWeekLabel(a.payDay) + '</span>'; }
-    var complete = a.closed && wages != null && (n === 7 || n === 0);
+    var xeroWages = (a.payRun != null && a.payRun > 0);
+    var complete = a.closed && wages != null && (xeroWages || n === 7 || n === 0);
     if (complete) {
       var profit = a.sales.total - a.cogs.food - a.cogs.drink - a.cogs.other - wages - a.overheads;
       var ok = profit >= 0;
